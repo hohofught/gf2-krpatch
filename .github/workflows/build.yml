@@ -57,9 +57,11 @@ jobs:
           name: apk
           path: out/*.apk
 
+      # 손으로 올린(로컬 검증된) APK 가 이미 붙어 있으면 CI 빌드로 덮어쓰지 않는다.
       - name: Publish release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: out/*.apk
+          overwrite_files: false
           generate_release_notes: true
