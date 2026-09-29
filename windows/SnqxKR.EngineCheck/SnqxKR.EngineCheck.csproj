@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- 윈도우 앱의 번역 엔진(Engine/*.cs)을 실제 파일로 검증하는 콘솔. 안드로이드 LangTableTest 와 같은 시나리오. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net48</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="..\SnqxKR.Windows\Engine\*.cs" Link="Engine\%(Filename)%(Extension)" />
+    <Compile Include="..\SnqxKR.Windows\Polyfills.cs" Link="Polyfills.cs" />
+  </ItemGroup>
+
+</Project>

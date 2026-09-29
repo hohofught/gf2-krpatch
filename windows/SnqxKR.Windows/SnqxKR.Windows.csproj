@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!-- Windows 10(1903+)·11 에 기본으로 들어 있는 .NET Framework 4.8: 따로 설치할 것 없이 exe 하나로 돈다 -->
+    <TargetFramework>net48</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>SnqxKR</RootNamespace>
+    <AssemblyName>SnqxKR</AssemblyName>
+    <Version>0.2.0</Version>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 64비트 윈도우에서는 64비트로 (50MB 표 두 개를 한 번에 다룬다) -->
+    <PlatformTarget>AnyCPU</PlatformTarget>
+    <Prefer32Bit>false</Prefer32Bit>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <!-- 배포본은 exe 하나만: 디버그 정보를 exe 안에 넣고 pdb·config 를 따로 만들지 않는다 -->
+  <PropertyGroup Condition="'$(Configuration)' == 'Release'">
+    <DebugType>embedded</DebugType>
+    <GenerateSupportedRuntime>false</GenerateSupportedRuntime>
+  </PropertyGroup>
+
+  <!-- 시작점은 Program.Main: 관리자 권한 도우미(scan, copy 명령)는 WPF 를 띄우지 않는다 -->
+  <PropertyGroup>
+    <StartupObject>SnqxKR.Program</StartupObject>
+  </PropertyGroup>
+  <ItemGroup>
+    <ApplicationDefinition Remove="App.xaml" />
+    <Page Include="App.xaml" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="System.Net.Http" />
+    <Reference Include="Microsoft.CSharp" />
+  </ItemGroup>
+
+</Project>
