@@ -18,4 +18,8 @@ interface IFileService {
     boolean isDir(String path) = 9;
     /** true if a process with this package name is alive (game must be closed before patching) */
     boolean isRunning(String pkg) = 10;
+    /** Hangul syllables in the first maxBytes of a LangPackageTable body; -1 if unreadable */
+    int hangulCount(String path, int maxBytes) = 11;
+    /** game-version fingerprint (id set) of a LangPackageTable file; null if unreadable */
+    String tableLayout(String path) = 12;
 }

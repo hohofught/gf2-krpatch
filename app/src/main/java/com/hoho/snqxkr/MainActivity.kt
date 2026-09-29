@@ -1,10 +1,15 @@
 package com.hoho.snqxkr
 
+import android.Manifest
 import android.content.Intent
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -19,9 +24,13 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.HelpOutline
+import androidx.compose.material.icons.rounded.AutoFixHigh
 import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CleaningServices
 import androidx.compose.material.icons.rounded.Download
@@ -29,7 +38,7 @@ import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.material.icons.rounded.ExpandLess
 import androidx.compose.material.icons.rounded.ExpandMore
 import androidx.compose.material.icons.rounded.Folder
-import androidx.compose.material.icons.rounded.HelpOutline
+import androidx.compose.material.icons.rounded.Notifications
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Security
@@ -50,9 +59,13 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SegmentedButton
+import androidx.compose.material3.SegmentedButtonDefaults
+import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBarDefaults
@@ -81,22 +94,47 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         enableEdgeToEdge()
         super.onCreate(savedInstanceState)
+        // Shizuku 공식 예제대로 onCreate 에서 등록, onDestroy 에서 해제
+        ShizukuBridge.addListeners()
         setContent {
             SnqxKRTheme {
                 val model: PatchViewModel = viewModel()
                 vm = model
+                LaunchedEffect(Unit) { openFromNotice(intent) }
                 PatchScreen(model)
             }
         }
     }
 
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        openFromNotice(intent)
+    }
+
+    /** 알림을 탭해서 들어오면 그 클라이언트를 보여준다 */
+    private fun openFromNotice(intent: Intent?) {
+        intent?.getStringExtra(Notices.EXTRA_PKG)?.let { vm?.selectGame(it) }
+    }
+
+    override fun onStart() {
+        super.onStart()
+        ShizukuBridge.uiVisible = true
+    }
+
     override fun onResume() {
         super.onResume()
         vm?.refresh()
+        vm?.onNotificationPermission()
+    }
+
+    override fun onStop() {
+        super.onStop()
+        ShizukuBridge.uiVisible = false
     }
 
     override fun onDestroy() {
         super.onDestroy()
+        ShizukuBridge.removeListeners()
         if (isFinishing) ShizukuBridge.unbind()
     }
 }
@@ -140,16 +178,19 @@ fun PatchScreen(vm: PatchViewModel) {
             ),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
+            if (ui.installed.size > 1) item { ClientSelector(ui, vm) }
             item { StatusHero(ui) }
-            item { ActionButtons(ui, vm) }
+            // Shizuku 가 준비되기 전에는 적용 버튼 대신 준비 단계를 보여준다
+            item { if (ui.shizuku == ShizukuState.READY) ActionButtons(ui, vm) else SetupCard(ui, vm) }
             item { GameCard(ui) }
-            item { ShizukuCard(ui, vm) }
             item { PatchFileCard(ui, vm) }
+            item { SettingsCard(ui, vm) }
             item { MaintenanceCard(ui, vm) }
             item { LogCard(ui) }
             item {
                 Text(
-                    "패치 원본: nemasdf/haguel-baefo · 게임을 완전히 종료한 상태에서 적용하세요",
+                    "패치 원본: nemasdf/haguel-baefo · 중섭(官服·B服·QQ) 전용, 글로벌·한국 서버 클라이언트는 건드리지 않습니다 · " +
+                        "게임을 완전히 종료한 상태에서 적용하세요",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.outline,
                     modifier = Modifier.padding(horizontal = 4.dp, vertical = 8.dp),
@@ -177,24 +218,64 @@ private fun StatusHero(ui: UiState) {
         )
         ui.status == PatchStatus.NO_GAME -> HeroLook(
             Icons.Rounded.ErrorOutline, "게임 미설치",
-            "소녀전선2: 망명 중섭 클라이언트를 찾지 못했습니다", cs.errorContainer, cs.onErrorContainer
+            "소녀전선2: 망명 중섭(官服·B服·QQ) 클라이언트를 찾지 못했습니다", cs.errorContainer, cs.onErrorContainer
         )
-        ui.shizuku != ShizukuState.READY -> HeroLook(
-            Icons.Rounded.Security, "Shizuku 준비 필요",
-            "게임 폴더에 쓰려면 Shizuku 연결이 필요합니다", cs.tertiaryContainer, cs.onTertiaryContainer
+        ui.shizuku != ShizukuState.READY -> {
+            val (title, body) = when (ui.shizuku) {
+                ShizukuState.NOT_INSTALLED -> "Shizuku 설치 필요" to "게임 폴더에 쓰려면 Shizuku 가 필요합니다"
+                ShizukuState.NOT_RUNNING -> "Shizuku 실행 필요" to "Shizuku 앱에서 서비스를 시작하세요"
+                ShizukuState.OUTDATED -> "Shizuku 업데이트 필요" to "Shizuku v11 이상이 필요합니다"
+                ShizukuState.NO_PERMISSION -> "권한 허용 필요" to "아래 버튼으로 이 앱에 Shizuku 권한을 허용하세요"
+                else -> "Shizuku 에서 허용 필요" to "권한이 '다시 묻지 않음'으로 거부돼 있습니다"
+            }
+            HeroLook(Icons.Rounded.Security, title, body, cs.tertiaryContainer, cs.onTertiaryContainer)
+        }
+        // 게임 업데이트로 한패가 풀렸고, 받아 둔 한패는 아직 옛 버전용
+        ui.status == PatchStatus.OFFICIAL && ui.patchMatchesGame == false -> HeroLook(
+            Icons.Rounded.Warning, "게임 업데이트로 한글패치가 풀렸습니다",
+            if (ui.canRepair) "새 한패가 나오기 전까지 임시 복구로 쓸 수 있습니다. 새로 생긴 문장만 중국어로 남습니다"
+            else "새 한패를 기다리는 중입니다. 번역 메모리가 있으면 임시 복구할 수 있습니다",
+            cs.errorContainer, cs.onErrorContainer
+        )
+        ui.status == PatchStatus.REPAIRED && ui.patchMatchesGame == true -> HeroLook(
+            Icons.Rounded.Update, "정식 한글패치가 나왔습니다",
+            "임시 복구본을 정식 한패로 바꾸세요", cs.tertiaryContainer, cs.onTertiaryContainer
+        )
+        ui.status == PatchStatus.REPAIRED -> HeroLook(
+            Icons.Rounded.AutoFixHigh, "임시 복구 적용됨",
+            (if (ui.repairedCoverage >= 0) "한국어 " + PatchViewModel.percent(ui.repairedCoverage.toDouble()) + " · " else "") +
+                "정식 한패를 기다리는 중 · 확인 " + PatchViewModel.time(ui.checkedAt),
+            cs.secondaryContainer, cs.onSecondaryContainer
+        )
+        ui.status == PatchStatus.FOREIGN && ui.patchMatchesGame == false -> HeroLook(
+            Icons.Rounded.Warning, "게임 버전과 맞지 않는 한글패치",
+            "게임 업데이트 전 한패가 들어 있어 문장이 엉뚱하게 나올 수 있습니다. 게임 버전에 맞는 한패가 나오면 적용하세요",
+            cs.errorContainer, cs.onErrorContainer
         )
         ui.status == PatchStatus.PATCHED_LATEST -> HeroLook(
             Icons.Rounded.CheckCircle, "최신 한글패치 적용됨",
-            "적용 " + PatchViewModel.time(ui.appliedAt) + " · 확인 " + PatchViewModel.time(ui.checkedAt),
+            // 다른 앱(1.0 등)이나 손으로 넣은 경우엔 이 앱의 적용 기록이 없다
+            (if (ui.appliedAt > 0) "적용 " + PatchViewModel.time(ui.appliedAt) + " · " else "게임 폴더 파일이 최신 한패와 같습니다 · ") +
+                "확인 " + PatchViewModel.time(ui.checkedAt),
             cs.primaryContainer, cs.onPrimaryContainer
         )
         ui.status == PatchStatus.PATCHED_OLD -> HeroLook(
             Icons.Rounded.Update, "업데이트 있음",
             "새 한패가 올라왔습니다. 적용을 눌러 갱신하세요", cs.tertiaryContainer, cs.onTertiaryContainer
         )
+        ui.status == PatchStatus.OFFICIAL -> HeroLook(
+            Icons.Rounded.Translate, "한글패치 미적용",
+            "한글패치가 아직 적용되지 않았습니다. 게임 업데이트로 원본(중국어) 파일로 덮였을 수 있습니다",
+            cs.surfaceVariant, cs.onSurfaceVariant
+        )
+        ui.status == PatchStatus.FOREIGN && ui.cacheSha.isEmpty() -> HeroLook(
+            Icons.Rounded.Update, "한글패치 적용됨 · 확인 필요",
+            "최신 한패인지 아직 확인하지 않았습니다. '업데이트만 확인'을 눌러 주세요",
+            cs.secondaryContainer, cs.onSecondaryContainer
+        )
         ui.status == PatchStatus.FOREIGN -> HeroLook(
-            Icons.Rounded.Warning, "다른 파일 감지",
-            "이 앱이 넣지 않은 한패가 들어 있습니다 (" + PatchViewModel.human(ui.targetSize) + ")",
+            Icons.Rounded.Warning, "이전 버전 한글패치",
+            "최신이 아닌 한글패치가 들어 있습니다. 적용을 누르면 최신 한패로 바꿉니다",
             cs.tertiaryContainer, cs.onTertiaryContainer
         )
         ui.status == PatchStatus.NOT_PATCHED -> HeroLook(
@@ -202,7 +283,7 @@ private fun StatusHero(ui: UiState) {
             "아래 버튼 한 번이면 다운로드부터 적용까지 끝납니다", cs.surfaceVariant, cs.onSurfaceVariant
         )
         else -> HeroLook(
-            Icons.Rounded.HelpOutline, "상태 확인 필요",
+            Icons.AutoMirrored.Rounded.HelpOutline, "상태 확인 필요",
             "새로고침을 눌러 게임 폴더를 확인하세요", cs.surfaceVariant, cs.onSurfaceVariant
         )
     }
@@ -250,17 +331,34 @@ private fun StatusHero(ui: UiState) {
 
 @Composable
 private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
+    // 받아 둔 한패가 게임 버전과 안 맞으면 옛 한패 적용 대신 임시 복구를 앞에 둔다
+    val mismatch = ui.patchMatchesGame == false
+    val primary: Triple<String, ImageVector, () -> Unit>? = when {
+        ui.status == PatchStatus.REPAIRED && !mismatch -> Triple("정식 한패로 교체", Icons.Rounded.Download) { vm.downloadAndApply() }
+        mismatch && ui.status != PatchStatus.REPAIRED && ui.canRepair -> Triple("임시 복구", Icons.Rounded.AutoFixHigh) { vm.repair() }
+        mismatch -> null
+        else -> Triple("한글패치 적용", Icons.Rounded.Download) { vm.downloadAndApply() }
+    }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Button(
-            onClick = { vm.downloadAndApply() },
-            enabled = !ui.busy && ui.gamePkg != null && ui.shizuku == ShizukuState.READY,
-            modifier = Modifier.fillMaxWidth().height(56.dp),
-            shape = MaterialTheme.shapes.large,
-        ) {
-            Icon(Icons.Rounded.Download, contentDescription = null)
-            Spacer(Modifier.width(10.dp))
-            Text("한글패치 적용", style = MaterialTheme.typography.titleMedium)
+        if (primary != null) {
+            Button(
+                onClick = primary.third,
+                enabled = !ui.busy && ui.gamePkg != null && ui.shizuku == ShizukuState.READY,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = MaterialTheme.shapes.large,
+            ) {
+                Icon(primary.second, contentDescription = null)
+                Spacer(Modifier.width(10.dp))
+                Text(primary.first, style = MaterialTheme.typography.titleMedium)
+            }
         }
+        if (mismatch && !ui.canRepair && ui.status != PatchStatus.REPAIRED) {
+            Notice(
+                "받아 둔 한패는 이전 게임 버전용이라 넣지 않습니다. " +
+                    if (ui.canBootstrap) "아래 '번역 메모리 준비'를 하면 임시 복구할 수 있습니다." else "새 한패가 나오면 알려드립니다."
+            )
+        }
+        if (ui.remotePending) Notice("새 한패가 올라왔습니다. 모바일 데이터라 아직 받지 않았습니다 (설정에서 바꿀 수 있습니다)")
         OutlinedButton(
             onClick = { vm.checkUpdate() },
             enabled = !ui.busy,
@@ -346,6 +444,7 @@ private fun GameCard(ui: UiState) {
                 InfoRow("패키지", ui.gamePkg, mono = true)
                 InfoRow("버전", ui.gameVersion.ifEmpty { "-" })
                 InfoRow("상태", if (ui.gameRunning) "실행 중" else "종료됨")
+                if (ui.shizuku == ShizukuState.READY) InfoRow("접근 권한", accessLabel(ui.privilegedUid))
                 InfoRow("대상 경로", Paths.tableDir(ui.gamePkg), mono = true)
                 if (ui.targetSize >= 0) {
                     InfoRow("현재 파일", PatchViewModel.human(ui.targetSize) + " · " + PatchViewModel.time(ui.targetTime))
@@ -356,36 +455,128 @@ private fun GameCard(ui: UiState) {
     }
 }
 
+private fun accessLabel(uid: Int): String = "Shizuku" + when (uid) {
+    0 -> " · root"
+    2000 -> " · shell (무선 디버깅)"
+    -1 -> ""
+    else -> " · uid $uid"
+}
+
+/** 설치된 중섭 클라이언트가 둘 이상일 때 官服·B服·QQ 중 고르기 */
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun ShizukuCard(ui: UiState, vm: PatchViewModel) {
-    val context = LocalContext.current
-    val (label, desc) = when (ui.shizuku) {
-        ShizukuState.READY -> "연결됨" to
-                ("권한 있음" + if (ui.privilegedUid >= 0) " · uid " + ui.privilegedUid +
-                        (if (ui.privilegedUid == 0) " (root)" else if (ui.privilegedUid == 2000) " (shell)" else "") else "")
-        ShizukuState.NO_PERMISSION -> "권한 필요" to "아래 버튼을 눌러 이 앱에 Shizuku 권한을 허용하세요"
-        ShizukuState.NOT_RUNNING -> "미실행" to "Shizuku 앱을 열어 서비스를 시작하세요 (무선 디버깅 또는 root)"
-        ShizukuState.NOT_INSTALLED -> "미설치" to "Shizuku 앱이 필요합니다"
-    }
-    SectionCard(Icons.Rounded.Security, "Shizuku") {
-        Column {
-            InfoRow("상태", label)
-            Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
-            Spacer(Modifier.height(8.dp))
-            when (ui.shizuku) {
-                ShizukuState.NO_PERMISSION -> FilledTonalButton(onClick = { vm.requestShizukuPermission() }) {
-                    Text("권한 요청")
-                }
-                ShizukuState.NOT_RUNNING, ShizukuState.NOT_INSTALLED -> FilledTonalButton(onClick = {
-                    val intent = context.packageManager
-                        .getLaunchIntentForPackage("moe.shizuku.privileged.api")
-                        ?.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                    if (intent != null) context.startActivity(intent)
-                }) { Text("Shizuku 열기") }
-                ShizukuState.READY -> {}
-            }
+private fun ClientSelector(ui: UiState, vm: PatchViewModel) {
+    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+        ui.installed.forEachIndexed { i, g ->
+            SegmentedButton(
+                selected = g.pkg == ui.gamePkg,
+                onClick = { vm.selectGame(g.pkg) },
+                enabled = !ui.busy,
+                shape = SegmentedButtonDefaults.itemShape(index = i, count = ui.installed.size),
+            ) { Text(g.short) }
         }
     }
+}
+
+/**
+ * Shizuku 준비 3단계. 지금 할 일 하나만 큰 버튼으로 보여준다.
+ * 권한은 사용자가 버튼을 눌렀을 때만 요청한다 (앱을 열자마자 창을 띄우지 않는다).
+ */
+@Composable
+private fun SetupCard(ui: UiState, vm: PatchViewModel) {
+    val context = LocalContext.current
+    val s = ui.shizuku
+    val (actionLabel, action) = when (s) {
+        ShizukuState.NOT_INSTALLED -> "Shizuku 설치하기" to { ShizukuBridge.openInstallPage(context) }
+        ShizukuState.NOT_RUNNING -> "Shizuku 열어서 시작하기" to { ShizukuBridge.openShizuku(context); Unit }
+        ShizukuState.OUTDATED -> "Shizuku 업데이트하기" to { ShizukuBridge.openInstallPage(context) }
+        ShizukuState.NO_PERMISSION -> "권한 허용" to { vm.requestShizukuPermission(); Unit }
+        ShizukuState.DENIED -> "Shizuku 에서 허용하기" to { ShizukuBridge.openShizuku(context); Unit }
+        ShizukuState.READY -> return
+    }
+    val installed = s != ShizukuState.NOT_INSTALLED
+    val running = installed && s != ShizukuState.NOT_RUNNING && s != ShizukuState.OUTDATED
+
+    SectionCard(Icons.Rounded.Security, "처음 한 번 준비") {
+        Column {
+            Text(
+                "안드로이드 13부터 일반 앱은 다른 앱의 Android/data 폴더에 쓸 수 없습니다. " +
+                    "Shizuku 가 가진 adb(shell) 권한으로 게임 폴더의 한패 파일 하나만 바꿉니다. root 는 필요 없습니다.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            SetupStep(1, "Shizuku 설치", done = installed, current = !installed)
+            SetupStep(
+                2, "Shizuku 실행",
+                "Shizuku 앱 → 무선 디버깅으로 시작. Wi-Fi 에 연결돼 있어야 합니다 (폰 핫스팟만 켠 상태에서는 안 됨). " +
+                    "PC 가 있으면 USB 로 연결해서 Shizuku 앱에 나오는 adb 명령으로도 시작할 수 있습니다.",
+                done = running, current = installed && !running,
+            )
+            SetupStep(3, "이 앱에 권한 허용", done = false, current = running)
+            when (s) {
+                ShizukuState.NOT_RUNNING -> Notice("무선 디버깅·adb 로 시작한 Shizuku 는 폰을 다시 켜면 꺼집니다. 재부팅 뒤에는 Shizuku 앱에서 다시 시작하세요.")
+                ShizukuState.DENIED -> Notice(
+                    "권한 요청을 '다시 묻지 않음'으로 거부해서 요청 창이 더 뜨지 않습니다. " +
+                        "Shizuku 앱의 앱 관리에서 '소전2 한글패치'를 허용하세요."
+                )
+                ShizukuState.OUTDATED -> Notice("설치된 Shizuku 가 너무 오래됐습니다 (v11 미만). 최신 버전으로 업데이트하세요.")
+                else -> {}
+            }
+            Spacer(Modifier.height(12.dp))
+            Button(
+                onClick = action,
+                enabled = !ui.busy,
+                modifier = Modifier.fillMaxWidth().height(56.dp),
+                shape = MaterialTheme.shapes.large,
+            ) { Text(actionLabel, style = MaterialTheme.typography.titleMedium) }
+        }
+    }
+}
+
+@Composable
+private fun SetupStep(n: Int, title: String, sub: String? = null, done: Boolean, current: Boolean) {
+    val cs = MaterialTheme.colorScheme
+    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Surface(
+            shape = CircleShape,
+            color = when {
+                done -> cs.primary
+                current -> cs.primaryContainer
+                else -> cs.surfaceVariant
+            },
+            modifier = Modifier.size(28.dp),
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                if (done) Icon(Icons.Rounded.Check, contentDescription = "완료", tint = cs.onPrimary, modifier = Modifier.size(18.dp))
+                else Text(
+                    n.toString(),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = if (current) cs.onPrimaryContainer else cs.onSurfaceVariant,
+                )
+            }
+        }
+        Spacer(Modifier.width(12.dp))
+        Column {
+            Text(
+                title,
+                style = MaterialTheme.typography.bodyLarge,
+                fontWeight = if (current) FontWeight.SemiBold else FontWeight.Normal,
+                color = if (done || current) cs.onSurface else cs.onSurfaceVariant,
+            )
+            if (sub != null) Text(sub, style = MaterialTheme.typography.bodySmall, color = cs.onSurfaceVariant)
+        }
+    }
+}
+
+@Composable
+private fun Notice(text: String) {
+    Text(
+        text,
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.error,
+        modifier = Modifier.padding(top = 8.dp),
+    )
 }
 
 @Composable
@@ -396,6 +587,39 @@ private fun PatchFileCard(ui: UiState, vm: PatchViewModel) {
             InfoRow("SHA-256", if (ui.cacheSha.isEmpty()) "-" else ui.cacheSha.take(16) + "…", mono = true)
             InfoRow("마지막 확인", PatchViewModel.time(ui.checkedAt))
             InfoRow("마지막 적용", PatchViewModel.time(ui.appliedAt))
+            InfoRow(
+                "게임 버전",
+                when (ui.patchMatchesGame) {
+                    true -> "받은 한패가 지금 게임 버전용입니다"
+                    false -> "받은 한패는 이전 게임 버전용입니다"
+                    null -> "확인 전"
+                }
+            )
+            if (ui.status == PatchStatus.REPAIRED) {
+                InfoRow(
+                    "임시 복구",
+                    (if (ui.repairedCoverage >= 0) "한국어 " + PatchViewModel.percent(ui.repairedCoverage.toDouble()) + " · " else "") +
+                        PatchViewModel.time(ui.repairedAt)
+                )
+            }
+            InfoRow(
+                "번역 메모리",
+                if (ui.memorySize > 0) "%,d줄 · %s".format(ui.memorySize, PatchViewModel.time(ui.memoryAt)) else "없음"
+            )
+            if (ui.canBootstrap) {
+                Spacer(Modifier.height(4.dp))
+                FilledTonalButton(onClick = { vm.prepareMemory() }, enabled = !ui.busy) {
+                    Icon(Icons.Rounded.AutoFixHigh, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("번역 메모리 준비")
+                }
+                Text(
+                    "처음 적용할 때 백업해 둔 원본과 같은 버전의 옛 한패(약 50MB)를 GitHub 이력에서 받아 만듭니다. " +
+                        "게임 업데이트 뒤 새 한패가 나오기 전에 임시 복구할 때 씁니다.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             Spacer(Modifier.height(4.dp))
             Text(
                 vm.patchUrl,
@@ -409,6 +633,106 @@ private fun PatchFileCard(ui: UiState, vm: PatchViewModel) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+/**
+ * 백그라운드 확인·알림 설정. 기본은 전부 꺼져 있고(예약 작업 없음), 켤 때 알림 권한을 묻는다.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SettingsCard(ui: UiState, vm: PatchViewModel) {
+    val context = LocalContext.current
+    val askNotifications = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        vm.onNotificationPermission()
+    }
+    val needsPermission = Build.VERSION.SDK_INT >= 33 && !ui.notificationsAllowed
+    SectionCard(Icons.Rounded.Notifications, "백그라운드 확인·알림") {
+        Column {
+            SwitchRow(
+                "백그라운드에서 확인",
+                if (ui.autoCheck) "${ui.checkIntervalHours}시간마다 한 번, 네트워크가 있고 배터리·저장공간이 부족하지 않을 때만 잠깐 확인합니다. " +
+                    "바뀐 게 없으면 파일을 다시 읽지 않고, 게임 파일은 바꾸지 않습니다."
+                else "꺼져 있으면 앱을 열 때만 확인합니다 (백그라운드 작업 없음).",
+                ui.autoCheck, enabled = true,
+            ) { on ->
+                vm.setAutoCheck(on)
+                // 알림 권한은 기능을 켜는 이 순간에만 묻는다
+                if (on && needsPermission) askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            if (ui.autoCheck) {
+                Text(
+                    "확인 주기",
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(top = 4.dp, bottom = 6.dp),
+                )
+                val choices = listOf(6, 12, 24)
+                SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+                    choices.forEachIndexed { i, h ->
+                        SegmentedButton(
+                            selected = ui.checkIntervalHours == h,
+                            onClick = { vm.setCheckInterval(h) },
+                            shape = SegmentedButtonDefaults.itemShape(index = i, count = choices.size),
+                        ) { Text("${h}시간") }
+                    }
+                }
+                SwitchRow(
+                    "모바일 데이터로도 받기",
+                    "끄면 백그라운드에서는 Wi-Fi 일 때만 한패(약 56MB)를 받고, 모바일 데이터에서는 새 한패가 있는지만 봅니다. " +
+                        "앱에서 직접 누른 적용·확인은 항상 받습니다.",
+                    ui.allowMobileData, enabled = true,
+                ) { vm.setAllowMobileData(it) }
+
+                Text(
+                    "알림",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                SwitchRow("한글패치가 풀렸을 때", "게임 업데이트 등으로 한패가 원본으로 바뀌었을 때", ui.notifyUnpatched, enabled = true) {
+                    vm.setNotifyUnpatched(it)
+                }
+                SwitchRow("정식 한글패치가 나왔을 때", "임시 복구 중에 게임 버전에 맞는 한패가 올라왔을 때", ui.notifyOfficial, enabled = true) {
+                    vm.setNotifyOfficial(it)
+                }
+                SwitchRow("번역 갱신", "같은 게임 버전 한패의 번역이 고쳐졌을 때. 일주일에 여러 번 올 수 있습니다", ui.notifyUpdate, enabled = true) {
+                    vm.setNotifyUpdate(it)
+                }
+                if (needsPermission && (ui.notifyUnpatched || ui.notifyOfficial || ui.notifyUpdate)) {
+                    Notice("알림 권한이 없어서 알려 드릴 수 없습니다. 확인 결과는 앱을 열면 보입니다.")
+                    Spacer(Modifier.height(8.dp))
+                    FilledTonalButton(onClick = { askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS) }) {
+                        Text("알림 허용")
+                    }
+                }
+                TextButton(onClick = {
+                    context.startActivity(
+                        Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                            .putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+                            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                    )
+                }) { Text("안드로이드 알림 설정 열기") }
+                if (ui.lastCheckAt > 0) {
+                    Text(
+                        "마지막 확인 " + PatchViewModel.time(ui.lastCheckAt) + " · " + ui.lastCheckNote,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SwitchRow(title: String, desc: String, checked: Boolean, enabled: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(12.dp))
+        Switch(checked = checked, onCheckedChange = onChange, enabled = enabled)
     }
 }
 
@@ -428,7 +752,8 @@ private fun MaintenanceCard(ui: UiState, vm: PatchViewModel) {
                 }
                 OutlinedButton(
                     onClick = { vm.removePatch() },
-                    enabled = !ui.busy && ui.status != PatchStatus.NOT_PATCHED && ui.gamePkg != null,
+                    enabled = !ui.busy && ui.gamePkg != null &&
+                        ui.status != PatchStatus.NOT_PATCHED && ui.status != PatchStatus.OFFICIAL,
                     modifier = Modifier.weight(1f),
                 ) { Text("패치 제거") }
             }

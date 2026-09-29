@@ -1,7 +1,6 @@
 package com.hoho.snqxkr
 
 import android.app.Application
-import android.content.pm.PackageManager
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
@@ -15,17 +14,9 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-enum class PatchStatus {
-    UNKNOWN,        // 아직 확인 못함 (Shizuku 미연결 등)
-    NO_GAME,        // 게임 미설치
-    NOT_PATCHED,    // 대상 파일 없음
-    PATCHED_LATEST, // 적용됨 + 최신 한패
-    PATCHED_OLD,    // 적용됨 + 서버에 새 한패 있음
-    FOREIGN         // 내가 넣지 않은 파일이 들어 있음
-}
-
 data class UiState(
-    val gamePkg: String? = null,
+    val installed: List<GamePkg> = emptyList(),  // 설치된 중섭 클라이언트 전부
+    val gamePkg: String? = null,                  // 그중 지금 다루는 것
     val gameLabel: String = "",
     val gameVersion: String = "",
     val shizuku: ShizukuState = ShizukuState.NOT_RUNNING,
@@ -40,6 +31,26 @@ data class UiState(
     val appliedAt: Long = 0,
     val hasBackup: Boolean = false,
     val gameRunning: Boolean = false,
+    /** 받아 둔 한패가 지금 게임 버전용인지. 모르면 null */
+    val patchMatchesGame: Boolean? = null,
+    /** 지금 게임 버전으로 임시 복구본을 만들 수 있는지 */
+    val canRepair: Boolean = false,
+    val repairedAt: Long = 0,
+    val repairedCoverage: Float = -1f,
+    val memorySize: Int = 0,
+    val memoryAt: Long = 0,
+    /** 1.0 이 남긴 원본 백업으로 번역 메모리를 준비할 수 있음 */
+    val canBootstrap: Boolean = false,
+    val autoCheck: Boolean = false,
+    val checkIntervalHours: Int = 12,
+    val allowMobileData: Boolean = false,
+    val notifyUnpatched: Boolean = true,
+    val notifyOfficial: Boolean = true,
+    val notifyUpdate: Boolean = false,
+    val remotePending: Boolean = false,
+    val notificationsAllowed: Boolean = true,
+    val lastCheckAt: Long = 0,
+    val lastCheckNote: String = "",
     val busy: Boolean = false,
     val busyLabel: String = "",
     val progress: Float = -1f,
@@ -50,7 +61,8 @@ data class UiState(
 
 class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
-    private val repo = PatchRepository(app)
+    private val engine = PatchEngine(app)
+    private val repo = engine.repo
     private val _ui = MutableStateFlow(UiState())
     val ui: StateFlow<UiState> = _ui.asStateFlow()
 
@@ -65,44 +77,122 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
     fun dismissSnack() = _ui.update { it.copy(snack = null) }
 
     init {
-        ShizukuBridge.init()
+        // Shizuku 가 켜지거나 꺼질 때, 권한 결과가 올 때 화면을 다시 맞춘다
+        viewModelScope.launch { ShizukuBridge.changes.collect { refresh() } }
+        PatchCheckWorker.schedule(app, repo.autoCheck, repo.checkIntervalHours)
         refresh()
     }
+
+    private var migrated = false
 
     fun refresh() = viewModelScope.launch {
         val app = getApplication<Application>()
         val pm = app.packageManager
-        val found = Paths.GAME_PACKAGES.firstNotNullOfOrNull { g ->
+        val installed = Paths.GAME_PACKAGES.mapNotNull { g ->
             runCatching { pm.getPackageInfo(g.pkg, 0) }.getOrNull()?.let { g to it }
         }
+        if (!migrated && installed.isNotEmpty()) {
+            repo.migrateLegacy(installed.first().first.pkg)
+            migrated = true
+        }
+        val chosen = installed.firstOrNull { it.first.pkg == repo.selectedPkg } ?: installed.firstOrNull()
         val shizuku = ShizukuBridge.state(app)
 
         _ui.update {
+            val switched = it.gamePkg != chosen?.first?.pkg
             it.copy(
-                gamePkg = found?.first?.pkg,
-                gameLabel = found?.first?.label.orEmpty(),
-                gameVersion = found?.second?.versionName.orEmpty(),
+                installed = installed.map { p -> p.first },
+                gamePkg = chosen?.first?.pkg,
+                gameLabel = chosen?.first?.label.orEmpty(),
+                gameVersion = chosen?.second?.versionName.orEmpty(),
                 shizuku = shizuku,
-                cacheSize = if (repo.cacheFile.isFile) repo.cacheFile.length() else -1,
-                cacheSha = repo.cachedSha,
-                checkedAt = repo.checkedAt,
-                appliedAt = repo.appliedAt,
-                hasBackup = repo.backupFile.isFile,
-                status = if (found == null) PatchStatus.NO_GAME else it.status,
-            )
+                status = when {
+                    chosen == null -> PatchStatus.NO_GAME
+                    switched -> PatchStatus.UNKNOWN
+                    else -> it.status
+                },
+                targetSize = if (switched) -1 else it.targetSize,
+                targetSha = if (switched) "" else it.targetSha,
+            ).withStored()
         }
-        if (found == null) {
+        if (chosen == null) {
             log("소전2 중섭 클라이언트를 찾지 못했습니다")
             return@launch
         }
         if (shizuku == ShizukuState.READY) inspectTarget()
     }
 
-    fun requestShizukuPermission() = viewModelScope.launch {
-        val granted = ShizukuBridge.requestPermission()
-        log(if (granted) "Shizuku 권한 승인됨" else "Shizuku 권한 거부됨")
+    /** 저장된 기록·설정을 화면 상태에 옮긴다 */
+    private fun UiState.withStored(): UiState {
+        val t = gamePkg?.let { repo.target(it) }
+        return copy(
+            cacheSize = if (repo.cacheFile.isFile) repo.cacheFile.length() else -1,
+            cacheSha = repo.cachedSha,
+            checkedAt = repo.checkedAt,
+            appliedAt = t?.appliedAt ?: 0L,
+            hasBackup = t?.backupFile?.isFile == true,
+            repairedAt = t?.repairedAt ?: 0L,
+            repairedCoverage = t?.repairedCoverage ?: -1f,
+            memorySize = if (repo.memoryFile.isFile) repo.memorySize else 0,
+            memoryAt = repo.memoryAt,
+            canBootstrap = engine.canBootstrap(),
+            autoCheck = repo.autoCheck,
+            checkIntervalHours = repo.checkIntervalHours,
+            allowMobileData = repo.allowMobileData,
+            notifyUnpatched = repo.notifyUnpatched,
+            notifyOfficial = repo.notifyOfficial,
+            notifyUpdate = repo.notifyUpdate,
+            remotePending = repo.remotePending,
+            notificationsAllowed = Notices.permitted(getApplication()),
+            lastCheckAt = repo.lastCheckAt,
+            lastCheckNote = repo.lastCheckNote,
+        )
+    }
+
+    /** 官服·B服·QQ 중 다룰 클라이언트 고르기 (알림을 탭해서 들어온 경우 포함) */
+    fun selectGame(pkg: String) {
+        if (Paths.GAME_PACKAGES.none { it.pkg == pkg }) return
+        if (_ui.value.busy || pkg == _ui.value.gamePkg) return
+        repo.selectedPkg = pkg
         refresh()
     }
+
+    fun requestShizukuPermission() = viewModelScope.launch {
+        val granted = ShizukuBridge.requestPermission()
+        val state = ShizukuBridge.state(getApplication())
+        log(
+            when {
+                granted -> "Shizuku 권한 승인됨"
+                state == ShizukuState.DENIED -> "Shizuku 권한이 '다시 묻지 않음'으로 거부돼 있습니다. Shizuku 앱에서 허용하세요"
+                else -> "Shizuku 권한 거부됨"
+            }
+        )
+        refresh()
+    }
+
+    /** 끄면 예약 작업 자체를 지운다 */
+    fun setAutoCheck(enabled: Boolean) {
+        repo.autoCheck = enabled
+        PatchCheckWorker.schedule(getApplication(), enabled, repo.checkIntervalHours)
+        _ui.update { it.withStored() }
+    }
+
+    fun setCheckInterval(hours: Int) {
+        repo.checkIntervalHours = hours
+        PatchCheckWorker.schedule(getApplication(), repo.autoCheck, hours)
+        _ui.update { it.withStored() }
+    }
+
+    fun setAllowMobileData(enabled: Boolean) {
+        repo.allowMobileData = enabled
+        _ui.update { it.withStored() }
+    }
+
+    fun setNotifyUnpatched(enabled: Boolean) { repo.notifyUnpatched = enabled; _ui.update { it.withStored() } }
+    fun setNotifyOfficial(enabled: Boolean) { repo.notifyOfficial = enabled; _ui.update { it.withStored() } }
+    fun setNotifyUpdate(enabled: Boolean) { repo.notifyUpdate = enabled; _ui.update { it.withStored() } }
+
+    fun onNotificationPermission() = _ui.update { it.withStored() }
 
     private suspend fun service(): IFileService? {
         ShizukuBridge.service?.let { return it }
@@ -120,40 +210,20 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             _ui.update { it.copy(status = PatchStatus.UNKNOWN) }
             return
         }
-        val path = Paths.targetFile(pkg)
-        val info = withContext(Dispatchers.IO) {
-            runCatching {
-                val exists = svc.exists(path)
-                Triple(
-                    exists,
-                    if (exists) svc.sha256(path).orEmpty() else "",
-                    if (exists) svc.size(path) else -1L
-                ) to (svc.lastModified(path) to svc.isRunning(pkg))
-            }.getOrNull()
-        }
-        if (info == null) {
-            log("게임 폴더 확인 실패")
-            return
-        }
-        val (triple, extra) = info
-        val (exists, sha, size) = triple
-        val uid = runCatching { svc.selfUid() }.getOrDefault(-1)
-
-        val status = when {
-            !exists -> PatchStatus.NOT_PATCHED
-            sha.isNotEmpty() && sha == repo.cachedSha -> PatchStatus.PATCHED_LATEST
-            sha.isNotEmpty() && sha == repo.appliedSha -> PatchStatus.PATCHED_OLD
-            else -> PatchStatus.FOREIGN
-        }
+        val info = engine.inspect(svc, pkg, ::log) ?: return
+        val patchLayout = engine.patchLayout()
         _ui.update {
             it.copy(
-                status = status,
-                targetSize = size,
-                targetSha = sha,
-                targetTime = extra.first,
-                gameRunning = extra.second,
-                privilegedUid = uid,
-            )
+                status = info.status,
+                targetSize = info.size,
+                targetSha = info.sha,
+                targetTime = info.modified,
+                gameRunning = info.running,
+                privilegedUid = info.uid,
+                patchMatchesGame = if (info.gameLayout.isEmpty() || patchLayout.isEmpty()) null
+                else info.gameLayout == patchLayout,
+                canRepair = engine.canRepair(pkg, info),
+            ).withStored()
         }
     }
 
@@ -167,16 +237,10 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         inspectTargetInternal()
     }
 
-    /** 다운로드(필요 시) 후 게임 폴더에 적용 */
+    /** 다운로드(필요 시) 후 게임 폴더에 적용. 게임 버전과 안 맞는 한패는 넣지 않는다. */
     fun downloadAndApply() = launchTask(busyLabel = "패치 적용 중") {
         val pkg = _ui.value.gamePkg ?: run { log("게임이 설치돼 있지 않습니다"); return@launchTask }
         val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return@launchTask }
-
-        if (withContext(Dispatchers.IO) { runCatching { svc.isRunning(pkg) }.getOrDefault(false) }) {
-            _ui.update { it.copy(gameRunning = true, snack = "게임이 실행 중입니다. 완전히 종료한 뒤 적용하세요") }
-            log("게임 실행 중 → 적용 중단")
-            return@launchTask
-        }
 
         when (val r = doSync()) {
             is SyncResult.Failed -> {
@@ -191,71 +255,67 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             is SyncResult.Downloaded -> log("새 한패 받음 · " + human(r.size))
         }
 
-        val src = repo.cacheFile
-        if (!src.isFile) { log("한패 파일이 없습니다"); return@launchTask }
-        val srcSha = repo.cachedSha
-        val dst = Paths.targetFile(pkg)
-
         _ui.update { it.copy(busyLabel = "게임 폴더에 복사 중", progress = -1f, progressText = "") }
-
-        val result = withContext(Dispatchers.IO) {
-            runCatching {
-                val exists = svc.exists(dst)
-                val curSha = if (exists) svc.sha256(dst).orEmpty() else ""
-                if (exists && curSha == srcSha) return@runCatching "SAME"
-
-                // 원본(혹은 이전 파일) 백업은 최초 1회만
-                if (exists && !repo.backupFile.isFile) {
-                    repo.backupFile.parentFile?.mkdirs()
-                    val err = svc.copyFile(dst, repo.backupFile.absolutePath)
-                    if (err != null) return@runCatching "BACKUP_FAIL:" + err
-                }
-                val err = svc.copyFile(src.absolutePath, dst)
-                if (err != null) return@runCatching "COPY_FAIL:" + err
-                val after = svc.sha256(dst).orEmpty()
-                if (after != srcSha) return@runCatching "VERIFY_FAIL:" + after
-                "OK"
-            }.getOrElse { "EX:" + it.message }
+        val snack = when (val r = engine.apply(svc, pkg, ::log)) {
+            ApplyOutcome.Applied -> { log("적용 완료"); "한글패치 적용 완료" }
+            ApplyOutcome.Same -> { log("이미 최신 한패가 적용돼 있습니다 · 복사 생략"); "이미 최신 한글패치가 적용돼 있습니다" }
+            ApplyOutcome.GameRunning -> {
+                _ui.update { it.copy(gameRunning = true) }
+                log("게임 실행 중 → 적용 중단")
+                "게임이 실행 중입니다. 완전히 종료한 뒤 적용하세요"
+            }
+            ApplyOutcome.NoPatch -> { log("한패 파일이 없습니다"); "한패 파일이 없습니다" }
+            ApplyOutcome.VersionMismatch -> {
+                log("한패가 아직 이 게임 버전용이 아닙니다 → 적용 중단")
+                "이 한패는 아직 새 게임 버전용이 아닙니다. 임시 복구를 쓰세요"
+            }
+            is ApplyOutcome.Failed -> { log("적용 실패 · " + r.message); "적용 실패: " + r.message }
         }
+        _ui.update { it.copy(snack = snack) }
+        inspectTargetInternal()
+    }
 
-        when {
-            result == "SAME" -> {
-                repo.appliedSha = srcSha
-                log("이미 최신 한패가 적용돼 있습니다 · 복사 생략")
-                _ui.update { it.copy(snack = "이미 최신 한글패치가 적용돼 있습니다") }
+    /** 게임 업데이트로 한패가 안 맞을 때, 번역 메모리로 새 공식 원본을 한국어화해서 넣는다 */
+    fun repair() = launchTask(busyLabel = "임시 복구 중") {
+        val pkg = _ui.value.gamePkg ?: return@launchTask
+        val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return@launchTask }
+        _ui.update { it.copy(busyLabel = "새 공식 원본을 한국어로 바꾸는 중", progress = -1f) }
+        val snack = when (val r = engine.repair(svc, pkg, ::log)) {
+            is RepairOutcome.Done -> {
+                val pct = percent(r.coverage)
+                log("임시 복구 완료 · 한국어 $pct (${r.translated}줄), 중국어로 남음 ${r.leftChinese}줄")
+                "임시 복구 완료 · 한국어 $pct"
             }
-            result == "OK" -> {
-                repo.appliedSha = srcSha
-                repo.appliedAt = System.currentTimeMillis()
-                log("적용 완료 · " + human(src.length()))
-                _ui.update { it.copy(snack = "한글패치 적용 완료", appliedAt = repo.appliedAt) }
-            }
-            result.startsWith("BACKUP_FAIL") -> {
-                log("백업 실패 → 중단 · " + result.substringAfter(':'))
-                _ui.update { it.copy(snack = "백업 실패로 중단했습니다") }
-            }
-            else -> {
-                log("적용 실패 · " + result)
-                _ui.update { it.copy(snack = "적용 실패: " + result) }
-            }
+            RepairOutcome.GameRunning -> "게임이 실행 중입니다. 완전히 종료한 뒤 복구하세요"
+            RepairOutcome.NoOfficial -> "이 게임 버전의 공식 원본을 아직 보관하지 못했습니다"
+            RepairOutcome.NoMemory -> "번역 메모리가 없습니다"
+            is RepairOutcome.Failed -> { log("복구 실패 · " + r.message); "복구 실패: " + r.message }
         }
+        _ui.update { it.copy(snack = snack) }
+        inspectTargetInternal()
+    }
+
+    /** 번역 메모리 준비: 1.0 이 남긴 원본 백업 + GitHub 이력의 같은 버전 한패 */
+    fun prepareMemory() = launchTask(busyLabel = "번역 메모리 준비 중") {
+        val ok = engine.bootstrapMemory(::log)
+        _ui.update { it.copy(snack = if (ok) "번역 메모리 준비 완료" else "번역 메모리를 준비하지 못했습니다") }
         inspectTargetInternal()
     }
 
     fun restoreBackup() = launchTask(busyLabel = "원본 복원 중") {
         val pkg = _ui.value.gamePkg ?: return@launchTask
         val svc = service() ?: return@launchTask
-        if (!repo.backupFile.isFile) { log("백업 파일이 없습니다"); return@launchTask }
-        val err = withContext(Dispatchers.IO) {
-            svc.copyFile(repo.backupFile.absolutePath, Paths.targetFile(pkg))
+        val snack = when (val r = engine.restoreBackup(svc, pkg, ::log)) {
+            RestoreOutcome.Restored -> { log("원본 복원 완료"); "원본 파일로 되돌렸습니다" }
+            RestoreOutcome.NoBackup -> "백업 파일이 없습니다"
+            RestoreOutcome.GameRunning -> "게임이 실행 중입니다. 완전히 종료한 뒤 복원하세요"
+            RestoreOutcome.OldVersion -> {
+                log("백업은 이전 게임 버전의 원본이라 복원하지 않았습니다")
+                "백업이 이전 게임 버전의 원본이라 되돌리면 문장이 엉뚱해집니다. 복원하지 않았습니다"
+            }
+            is RestoreOutcome.Failed -> { log("복원 실패 · " + r.message); "복원 실패: " + r.message }
         }
-        if (err == null) {
-            repo.appliedSha = ""
-            log("원본 복원 완료")
-            _ui.update { it.copy(snack = "원본 파일로 되돌렸습니다") }
-        } else {
-            log("복원 실패 · " + err)
-        }
+        _ui.update { it.copy(snack = snack) }
         inspectTargetInternal()
     }
 
@@ -264,7 +324,8 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         val svc = service() ?: return@launchTask
         val err = withContext(Dispatchers.IO) { svc.deleteFile(Paths.targetFile(pkg)) }
         if (err == null) {
-            repo.appliedSha = ""
+            repo.target(pkg).appliedSha = ""
+            repo.target(pkg).repairedSha = ""
             log("패치 파일 삭제 완료 (게임이 다시 중국어로 돌아갑니다)")
             _ui.update { it.copy(snack = "패치 파일을 삭제했습니다") }
         } else {
@@ -283,7 +344,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
     private suspend fun doSync(): SyncResult {
         _ui.update { it.copy(busyLabel = "한패 업데이트 확인 중", progress = -1f) }
-        val r = repo.sync { done, total ->
+        val r = engine.sync { done, total ->
             _ui.update {
                 it.copy(
                     busyLabel = "한패 다운로드 중",
@@ -292,15 +353,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 )
             }
         }
-        _ui.update {
-            it.copy(
-                progress = -1f,
-                progressText = "",
-                cacheSize = if (repo.cacheFile.isFile) repo.cacheFile.length() else -1,
-                cacheSha = repo.cachedSha,
-                checkedAt = repo.checkedAt,
-            )
-        }
+        _ui.update { it.copy(progress = -1f, progressText = "").withStored() }
         return r
     }
 
@@ -312,15 +365,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         } catch (t: Throwable) {
             log("오류: " + t)
         } finally {
-            _ui.update {
-                it.copy(
-                    busy = false,
-                    busyLabel = "",
-                    progress = -1f,
-                    progressText = "",
-                    hasBackup = repo.backupFile.isFile
-                )
-            }
+            _ui.update { it.copy(busy = false, busyLabel = "", progress = -1f, progressText = "").withStored() }
         }
     }
 
@@ -332,6 +377,8 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             bytes < 1024L * 1024 * 1024 -> String.format(Locale.US, "%.1f MB", bytes / (1024.0 * 1024))
             else -> String.format(Locale.US, "%.2f GB", bytes / (1024.0 * 1024 * 1024))
         }
+
+        fun percent(ratio: Double): String = String.format(Locale.US, "%.1f%%", ratio * 100)
 
         fun time(ms: Long): String =
             if (ms <= 0) "없음"

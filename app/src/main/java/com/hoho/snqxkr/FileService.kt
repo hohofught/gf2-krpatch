@@ -1,5 +1,6 @@
 package com.hoho.snqxkr
 
+import com.hoho.snqxkr.langtable.LangTable
 import java.io.File
 import java.security.MessageDigest
 import kotlin.system.exitProcess
@@ -79,6 +80,12 @@ class FileService : IFileService.Stub() {
     }
 
     override fun listDir(path: String): Array<String> = File(path).list() ?: emptyArray()
+
+    override fun hangulCount(path: String, maxBytes: Int): Int = LangTable.hangulCount(File(path), maxBytes)
+
+    /** 게임 버전 지문. 앱은 게임 폴더를 직접 못 읽으므로 이 프로세스에서 Id 만 훑어 계산한다. */
+    override fun tableLayout(path: String): String? =
+        runCatching { LangTable.layoutKeyOf(LangTable.readIds(File(path))) }.getOrNull()
 
     override fun isRunning(pkg: String): Boolean {
         val proc = File("/proc")

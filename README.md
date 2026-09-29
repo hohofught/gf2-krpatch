@@ -6,11 +6,12 @@
 
 ## 하는 일
 
-1. 설치된 중섭 클라이언트를 자동 감지 (`com.Sunborn.SnqxExilium` / `.bilibili` / `.qq`)
+1. 설치된 중섭 클라이언트를 모두 감지 (`com.Sunborn.SnqxExilium` / `.bilibili` / `.qq`), 여러 개면 官服·B服·QQ 중 골라서 적용.
+   글로벌·한국 서버 클라이언트는 허용 목록에 없으므로 절대 건드리지 않는다.
 2. `https://raw.githubusercontent.com/nemasdf/haguel-baefo/.../LangPackageTableCnData.bytes` 에서 최신 한패 다운로드
 3. Shizuku 특권 프로세스로 게임 폴더에 복사
    `/sdcard/Android/data/<pkg>/files/LocalCache/Data/Table/LangPackageTableCnData.bytes`
-4. 복사 후 SHA-256 재검증, 최초 1회 원본 자동 백업
+4. 복사 후 SHA-256 재검증, 클라이언트마다 최초 1회 원본 자동 백업
 
 ## 중복 다운로드 방지 (3단)
 
@@ -28,7 +29,8 @@ ETag 값은 콘텐츠 해시라 파일이 갱신될 때만 바뀐다.
 
 ## 요구 사항
 
-- Android 9+ (minSdk 28), Shizuku 실행 중 (무선 디버깅 또는 root)
+- Android 9+ (minSdk 28), Shizuku v11+ 실행 중 (무선 디버깅 또는 root, Sui 도 가능)
+- 권한은 Shizuku-API 공식 흐름대로 요청한다. "다시 묻지 않음"으로 거부했다면 요청 창이 뜨지 않으므로 Shizuku 앱의 앱 관리에서 허용한다.
 - 안드 13+ 에서 `Android/data` 직접 접근이 막혀 있어 Shizuku가 필수다.
   Shizuku가 root로 떠 있으면 uid 0, adb 페어링으로 떠 있으면 uid 2000(shell)으로 동작하며 둘 다 이 경로에 쓸 수 있다.
 
@@ -56,8 +58,11 @@ adb install -r snqx-krpatch-*.apk
 |---|---|
 | `IFileService.aidl` | 특권 프로세스에 노출하는 파일 API |
 | `FileService.kt` | Shizuku가 root/shell 프로세스에서 실행하는 실제 파일 조작 |
-| `ShizukuBridge.kt` | 권한 요청 + UserService 바인딩 |
-| `PatchRepository.kt` | 다운로드/ETag 캐시/해시 |
+| `ShizukuBridge.kt` | 바인더·권한 리스너(onCreate 등록/onDestroy 해제), 권한 요청, UserService 바인딩 |
+| `PatchRepository.kt` | 다운로드/ETag 캐시/해시, 클라이언트별 기록·설정 |
+| `PatchEngine.kt` | 상태 판정, 공식 원본 보관, 번역 메모리, 버전 불일치 차단, 임시 복구 |
+| `PatchCheckWorker.kt` | 백그라운드 확인(3시간)과 알림 |
+| `langtable/` | `LangPackageTableCnData.bytes` 파서·재작성·번역 메모리·복구 ([형식](docs/lang-table-format.md)) |
 | `PatchViewModel.kt` | 상태 판정, 적용·복원·제거 흐름 |
 | `MainActivity.kt` | Compose Material3 (dynamic color) UI |
 

@@ -38,6 +38,10 @@ android {
     }
 
     buildTypes {
+        // 배포본(서명 다름)과 나란히 설치해서 시험할 수 있게 패키지 이름을 나눈다
+        debug {
+            applicationIdSuffix = ".debug"
+        }
         release {
             isMinifyEnabled = true
             isShrinkResources = true
@@ -62,6 +66,14 @@ android {
     packaging {
         resources.excludes += setOf("META-INF/*.version", "META-INF/DEPENDENCIES")
     }
+
+    testOptions {
+        unitTests.all {
+            it.maxHeapSize = "4g"
+            // 실제 LangPackageTable 샘플 폴더 (./gradlew testDebugUnitTest -PsnqxSamples=...). 없으면 건너뛴다
+            it.systemProperty("snqx.samples", (project.findProperty("snqxSamples") as String?).orEmpty())
+        }
+    }
 }
 
 dependencies {
@@ -77,6 +89,10 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.11.0")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.11.0")
 
+    implementation("androidx.work:work-runtime-ktx:2.12.0")
+
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
+
+    testImplementation("junit:junit:4.13.2")
 }
