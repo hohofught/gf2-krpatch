@@ -2,6 +2,8 @@ package com.hoho.snqxkr.langtable
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import java.io.File
@@ -222,6 +224,28 @@ class LangTableTest {
         assertEquals(merged.byteSize, back.byteSize)
         val again = back.mergedWith(TranslationMemory.build(table("戊" to "무").first, table("戊" to "무").second)).capped(8L + 16 + 3)
         assertEquals("무", String(again["戊".toByteArray()]!!))
+    }
+
+    @Test
+    fun `깨진 번역 메모리만 형식 오류로 알린다`() {
+        val o = LangTable(longArrayOf(1, 2), arrayOf("甲".toByteArray(), "乙".toByteArray()))
+        val p = LangTable(longArrayOf(1, 2), arrayOf("갑".toByteArray(), "을".toByteArray()))
+        val good = File.createTempFile("snqx-tm", ".bin").apply { deleteOnExit() }
+        TranslationMemory.build(o, p).writeTo(good)
+        val bytes = good.readBytes()
+        val oneRowHeader = byteArrayOf(0x53, 0x4e, 0x51, 0x32, 0, 0, 0, 1)
+        // 빈 파일, 머리가 끊김, 줄 수가 파일보다 큼, 줄 머리에서 끊김, 번역 도중 끊김, 다른 파일
+        val broken = listOf(
+            ByteArray(0), bytes.copyOf(6), bytes.copyOf(8), oneRowHeader + ByteArray(12),
+            bytes.copyOf(bytes.size - 1), "not a translation memory".toByteArray(),
+        )
+        for (b in broken) {
+            val f = File.createTempFile("snqx-tm", ".bin").apply { deleteOnExit(); writeBytes(b) }
+            assertThrows(CorruptMemoryException::class.java) { TranslationMemory.read(f) }
+        }
+        // 못 여는 것은 형식 오류가 아니다 (합칠 때 쌓아 둔 메모리를 새것으로 덮으면 안 된다. C++·C# 과 같음)
+        val e = assertThrows(java.io.IOException::class.java) { TranslationMemory.read(File(good.path + ".none")) }
+        assertFalse(e is CorruptMemoryException)
     }
 
     private data class Comparison(val same: Int, val conflicting: Int, val missing: Int, val examples: List<String>)

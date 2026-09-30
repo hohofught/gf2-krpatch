@@ -46,30 +46,64 @@ class FileService : IFileService.Stub() {
     }
 
     override fun copyFile(src: String, dst: String): String? {
+        val s = File(src)
+        val d = File(dst)
+        val tmp = File(d.parentFile, d.name + ".tmp")
         return try {
-            val s = File(src)
             if (!s.isFile) return "원본 파일 없음: " + src
-            val d = File(dst)
             d.parentFile?.let { if (!it.exists() && !it.mkdirs()) return "대상 폴더 생성 실패: " + it.path }
-            val tmp = File(d.parentFile, d.name + ".tmp")
-            s.inputStream().use { i -> tmp.outputStream().use { o -> i.copyTo(o, 1 shl 16) } }
+            copy(s, tmp)
             if (tmp.length() != s.length()) {
                 tmp.delete()
                 return "복사 크기 불일치 (" + tmp.length() + " != " + s.length() + ")"
             }
-            // FUSE(/sdcard) 에서는 rename 이 막히는 경우가 있어 실패하면 직접 덮어쓰기로 폴백
-            if (d.exists()) d.delete()
-            if (!tmp.renameTo(d)) {
-                tmp.inputStream().use { i -> d.outputStream().use { o -> i.copyTo(o, 1 shl 16) } }
-                tmp.delete()
-            }
+            replace(tmp, d)
             runCatching {
                 d.setReadable(true, false)
                 d.setWritable(true, false)
             }
             null
         } catch (t: Throwable) {
+            tmp.delete()
             t.toString()
+        }
+    }
+
+    /**
+     * tmp 로 dst 를 바꾼다. 원래 파일은 다 바꿀 때까지 옆(.old)에 두고, 도중에 실패하면 되돌린다
+     * (게임 파일이 없어지거나 반쯤 쓰인 채로 남지 않게). 이 프로세스가 도중에 죽어 .old 만 남았으면 다음에 먼저 되살린다.
+     * FUSE(/sdcard) 에서는 rename 이 막히는 경우가 있어 그때는 복사로 한다.
+     */
+    private fun replace(tmp: File, dst: File) {
+        val old = File(dst.parentFile, dst.name + ".old")
+        if (old.isFile) {
+            if (dst.exists()) old.delete() else moveOrCopy(old, dst)
+        }
+        val had = dst.exists()
+        if (had) moveOrCopy(dst, old, keepSource = true)
+        try {
+            moveOrCopy(tmp, dst)
+        } catch (t: Throwable) {
+            if (had) runCatching { moveOrCopy(old, dst) }
+            throw t
+        }
+        if (had) old.delete()
+    }
+
+    /** from 을 to 로 옮긴다. rename 이 안 되면 복사하고 크기를 확인한다. keepSource 면 복사했을 때 from 을 지우지 않는다 */
+    private fun moveOrCopy(from: File, to: File, keepSource: Boolean = false) {
+        if (from.renameTo(to)) return
+        copy(from, to)
+        if (to.length() != from.length()) throw java.io.IOException("복사 크기 불일치 (" + to.length() + " != " + from.length() + ")")
+        if (!keepSource) from.delete()
+    }
+
+    private fun copy(from: File, to: File) {
+        from.inputStream().use { i ->
+            java.io.FileOutputStream(to).use { o ->
+                i.copyTo(o, 1 shl 16)
+                runCatching { o.fd.sync() } // 이름을 바꾸기 전에 내용을 디스크에 (지원하지 않는 파일 시스템도 있다)
+            }
         }
     }
 

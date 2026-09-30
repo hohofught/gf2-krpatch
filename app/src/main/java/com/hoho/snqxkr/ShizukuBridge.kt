@@ -12,6 +12,8 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import rikka.shizuku.Shizuku
 import kotlin.coroutines.resume
@@ -34,6 +36,9 @@ object ShizukuBridge {
     private const val REQUEST_CODE = 4242
     const val SHIZUKU_PKG = "moe.shizuku.privileged.api"
     private const val DOWNLOAD_URL = "https://shizuku.rikka.app/download/"
+
+    /** FileService 가 이 시간 안에 안 붙으면 실패로 본다 (첫 실행은 dex 를 올리느라 몇 초 걸린다) */
+    private const val BIND_TIMEOUT_MS = 15_000L
 
     @Volatile
     var service: IFileService? = null
@@ -172,46 +177,93 @@ object ShizukuBridge {
             .debuggable(BuildConfig.DEBUG)
             .version(BuildConfig.VERSION_CODE)
 
+    @Volatile
     private var connection: ServiceConnection? = null
 
-    /** FileService 바인딩. 이미 연결돼 있으면 그대로 반환. */
-    suspend fun bind(): Result<IFileService> {
-        service?.let { if (it.asBinder().pingBinder()) return Result.success(it) }
+    /** 화면과 백그라운드 작업이 동시에 붙어도 연결은 하나만 만든다 */
+    private val bindLock = Mutex()
+
+    /** FileService 바인딩. 이미 연결돼 있으면 그대로 반환. [BIND_TIMEOUT_MS] 안에 안 붙으면 실패. */
+    suspend fun bind(): Result<IFileService> = bindLock.withLock {
+        service?.let { if (it.asBinder().pingBinder()) return@withLock Result.success(it) }
         val ready = runCatching {
             Shizuku.pingBinder() && !Shizuku.isPreV11() &&
                 Shizuku.checkSelfPermission() == PackageManager.PERMISSION_GRANTED
         }.getOrDefault(false)
-        if (!ready) return Result.failure(IllegalStateException("Shizuku 가 준비되지 않았습니다"))
-        return suspendCancellableCoroutine { cont ->
-            val conn = object : ServiceConnection {
-                override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
-                    val svc = if (binder != null && binder.pingBinder()) {
-                        IFileService.Stub.asInterface(binder)
-                    } else null
-                    service = svc
-                    if (cont.isActive) {
-                        if (svc != null) cont.resume(Result.success(svc))
-                        else cont.resume(Result.failure(IllegalStateException("FileService 바인딩 실패")))
-                    }
-                }
+        if (!ready) return@withLock Result.failure(IllegalStateException("Shizuku 가 준비되지 않았습니다"))
+        // 죽은 서비스에 걸려 있던 연결은 풀고 새로 붙는다
+        connection?.let { old -> runCatching { Shizuku.unbindUserService(userServiceArgs, old, false) } }
+        connection = null
+        withTimeoutOrNull(BIND_TIMEOUT_MS) { connect() }
+            ?: Result.failure(IllegalStateException("FileService 연결 시간 초과 · Shizuku 앱에서 서비스가 실행 중인지 확인하세요"))
+    }
 
-                override fun onServiceDisconnected(name: ComponentName?) {
-                    service = null
+    private suspend fun connect(): Result<IFileService> = suspendCancellableCoroutine { cont ->
+        val conn = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, binder: IBinder?) {
+                val svc = if (binder != null && binder.pingBinder()) {
+                    IFileService.Stub.asInterface(binder)
+                } else null
+                // 시간이 지나 포기한 연결이 늦게 붙은 경우는 쓰지 않는다
+                if (connection === this) service = svc
+                if (cont.isActive) {
+                    if (svc != null) cont.resume(Result.success(svc))
+                    else cont.resume(Result.failure(IllegalStateException("FileService 바인딩 실패")))
                 }
             }
-            connection = conn
-            try {
-                Shizuku.bindUserService(userServiceArgs, conn)
-            } catch (t: Throwable) {
-                if (cont.isActive) cont.resume(Result.failure(t))
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                if (connection === this) service = null
             }
+        }
+        connection = conn
+        // 시간 초과·취소면 걸어 둔 연결을 거둔다 (반쯤 뜬 서비스도 내려 다음 연결이 새로 시작하게)
+        cont.invokeOnCancellation {
+            if (connection === conn) connection = null
+            runCatching { Shizuku.unbindUserService(userServiceArgs, conn, true) }
+        }
+        try {
+            Shizuku.bindUserService(userServiceArgs, conn)
+        } catch (t: Throwable) {
+            if (connection === conn) connection = null
+            if (cont.isActive) cont.resume(Result.failure(t))
         }
     }
 
-    fun unbind() {
+    private val holdLock = Any()
+    private var holders = 0
+    private var unbindPending = false
+
+    /**
+     * 게임 폴더 작업 동안 특권 프로세스를 붙잡아 둔다. 그동안 [unbindWhenIdle] 은 작업이 끝날 때로 미뤄진다
+     * (복사 도중에 프로세스를 내리면 게임 파일이 반쯤 쓰인 채로 남을 수 있다).
+     */
+    suspend fun <T> holding(block: suspend () -> T): T {
+        synchronized(holdLock) { holders++ }
+        try {
+            return block()
+        } finally {
+            val unbindNow = synchronized(holdLock) {
+                holders--
+                (holders == 0 && unbindPending).also { if (it) unbindPending = false }
+            }
+            if (unbindNow && !uiVisible) unbind()
+        }
+    }
+
+    /**
+     * 화면이 안 보일 때 특권 프로세스를 내린다 (백그라운드 작업이 끝날 때, 화면을 닫을 때).
+     * 누가 [holding] 중이면 그 작업이 끝날 때 다시 판단한다.
+     */
+    fun unbindWhenIdle() {
+        val busy = synchronized(holdLock) { (holders > 0).also { if (it) unbindPending = true } }
+        if (!busy && !uiVisible) unbind()
+    }
+
+    private fun unbind() {
         val conn = connection ?: return
-        runCatching { Shizuku.unbindUserService(userServiceArgs, conn, true) }
         connection = null
         service = null
+        runCatching { Shizuku.unbindUserService(userServiceArgs, conn, true) }
     }
 }

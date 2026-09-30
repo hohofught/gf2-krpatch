@@ -1,6 +1,7 @@
 package com.hoho.snqxkr
 
 import android.content.Context
+import com.hoho.snqxkr.langtable.LangTable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
@@ -335,6 +336,11 @@ class PatchRepository(private val app: Context) {
                 return@withContext SyncResult.UpToDate(cachedSha, cacheFile.length(), "내용 해시 동일")
             }
 
+            // 표가 아닌 파일(오류 페이지, 크기 정보 없이 끊긴 파일)이 한패 자리에 들어가지 않게 Id 까지 읽어 본다
+            runCatching { LangTable.readIds(tmp) }.onFailure {
+                tmp.delete()
+                return@withContext SyncResult.Failed("받은 파일이 한패 형식이 아닙니다 (" + it.message + ")")
+            }
             if (cacheFile.exists()) cacheFile.delete()
             if (!tmp.renameTo(cacheFile)) {
                 tmp.copyTo(cacheFile, overwrite = true)

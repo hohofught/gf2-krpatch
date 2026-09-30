@@ -5,6 +5,7 @@ using System.Net.Http;
 using System.Security.Cryptography;
 using System.Text;
 using System.Threading.Tasks;
+using SnqxKR.Engine;
 
 namespace SnqxKR
 {
@@ -123,6 +124,13 @@ namespace SnqxKR
                     if (newTag.Length > 0) store.Etag = newTag;
                     store.CheckedAt = Now();
                     return new SyncResult(SyncKind.UpToDate, "내용 해시 동일");
+                }
+                // 표가 아닌 파일(오류 페이지, 크기 정보 없이 끊긴 파일)이 한패 자리에 들어가지 않게 Id 까지 읽어 본다 (안드로이드와 같음)
+                try { LangTable.ReadIds(part); }
+                catch (Exception e)
+                {
+                    File.Delete(part);
+                    return new SyncResult(SyncKind.Failed, "받은 파일이 한패 형식이 아닙니다 (" + e.Message + ")");
                 }
                 if (File.Exists(cache)) File.Delete(cache);
                 File.Move(part, cache);

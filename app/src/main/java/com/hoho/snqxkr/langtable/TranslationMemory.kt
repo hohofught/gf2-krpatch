@@ -1,7 +1,15 @@
 package com.hoho.snqxkr.langtable
 
 import java.io.DataOutputStream
+import java.io.EOFException
 import java.io.File
+import java.io.IOException
+
+/**
+ * 번역 메모리 형식이 아닌 파일 (깨졌거나 잘림). 합칠 때 이것만 버리고 새로 만든다.
+ * 메모리 부족·읽기 오류는 여기에 들지 않는다 (쌓아 둔 메모리를 새것으로 덮으면 안 된다). C++ Corrupt·C# InvalidDataException 과 같다.
+ */
+class CorruptMemoryException(message: String) : IOException(message)
 
 /**
  * 중국어 원문 → 한국어 번역.
@@ -212,31 +220,38 @@ class TranslationMemory private constructor(
             val b = Texts.map(file)
             val size = b.capacity()
             val r = BufReader(b, size)
-            val be = r.u32be()
-            val big = be == MAGIC_V1 || be == MAGIC_V2
-            val magic = if (big) be else Integer.reverseBytes(be)
-            require(magic == MAGIC_V1 || magic == MAGIC_V2) { "번역 메모리 파일이 아닙니다" }
-            fun u32(): Int = if (big) r.u32be() else Integer.reverseBytes(r.u32be())
-            fun u64(): Long = if (big) r.u64be() else java.lang.Long.reverseBytes(r.u64be())
-            val n = u32()
-            // 줄마다 12바이트 이상이므로 파일 크기로 줄 수를 확인한다 (깨진 파일에 큰 배열을 잡지 않게)
-            require(n >= 0 && n <= (size - HEADER_BYTES) / 12) { "번역 메모리 줄 수가 이상함" }
-            val keys = LongArray(n)
-            val gens = IntArray(n)
-            val off = IntArray(n)
-            val len = IntArray(n)
-            var left = size - HEADER_BYTES
-            for (i in 0 until n) {
-                keys[i] = u64()
-                if (magic == MAGIC_V2) gens[i] = u32()
-                val l = u32()
-                left -= (if (magic == MAGIC_V2) ENTRY_BYTES else 12L) + l
-                require(l >= 0 && left >= 0) { "번역 메모리 파일이 끊김" }
-                off[i] = r.p; len[i] = l
-                r.p += l
+            // 매핑한 버퍼 끝에 닿은 것은 파일이 끊긴 것이다 (읽기 오류는 매핑할 때 난다)
+            try {
+                val be = r.u32be()
+                val big = be == MAGIC_V1 || be == MAGIC_V2
+                val magic = if (big) be else Integer.reverseBytes(be)
+                if (magic != MAGIC_V1 && magic != MAGIC_V2) corrupt("번역 메모리 파일이 아닙니다")
+                fun u32(): Int = if (big) r.u32be() else Integer.reverseBytes(r.u32be())
+                fun u64(): Long = if (big) r.u64be() else java.lang.Long.reverseBytes(r.u64be())
+                val n = u32()
+                // 줄마다 12바이트 이상이므로 파일 크기로 줄 수를 확인한다 (깨진 파일에 큰 배열을 잡지 않게)
+                if (n < 0 || n > (size - HEADER_BYTES) / 12) corrupt("번역 메모리 줄 수가 이상함")
+                val keys = LongArray(n)
+                val gens = IntArray(n)
+                val off = IntArray(n)
+                val len = IntArray(n)
+                var left = size - HEADER_BYTES
+                for (i in 0 until n) {
+                    keys[i] = u64()
+                    if (magic == MAGIC_V2) gens[i] = u32()
+                    val l = u32()
+                    left -= (if (magic == MAGIC_V2) ENTRY_BYTES else 12L) + l
+                    if (l < 0 || left < 0) corrupt("번역 메모리 파일이 끊김")
+                    off[i] = r.p; len[i] = l
+                    r.p += l
+                }
+                return TranslationMemory(keys, Texts(arrayOf(b), null, off, len), gens)
+            } catch (e: EOFException) {
+                corrupt("번역 메모리 파일이 끊김")
             }
-            return TranslationMemory(keys, Texts(arrayOf(b), null, off, len), gens)
         }
+
+        private fun corrupt(message: String): Nothing = throw CorruptMemoryException(message)
 
         /** FNV-1a 64 + murmur3 fmix64 (bytes 의 앞 n 바이트) */
         fun hash(bytes: ByteArray, n: Int = bytes.size): Long {

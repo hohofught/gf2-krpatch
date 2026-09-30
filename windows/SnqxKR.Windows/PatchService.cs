@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -47,6 +48,9 @@ namespace SnqxKR
     {
         private const int HangulSampleBytes = 2 * 1024 * 1024;
         private static readonly SemaphoreSlim Gate = new SemaphoreSlim(1, 1);
+
+        /// <summary>보관하다 실패한 공식 원본의 해시 (Gate 안에서만). 앱을 다시 켜면 한 번 더 해 본다</summary>
+        private static readonly HashSet<string> CaptureFailed = new HashSet<string>();
 
         private readonly Store store;
         private readonly Action<string> log;
@@ -111,7 +115,12 @@ namespace SnqxKR
             else status = PatchStatus.Foreign;
             t.Seen = stamp + "|" + sha + "|" + (hangul ?? -2);
 
-            if (status == PatchStatus.Official && t.OfficialSha != sha) CaptureOfficial(g, path, sha);
+            // 보관에 실패해도 상태 확인은 계속한다. 같은 파일로 복사를 되풀이하지 않게 이 실행 동안 기억한다 (안드로이드와 같음)
+            if (status == PatchStatus.Official && t.OfficialSha != sha && !CaptureFailed.Contains(sha))
+            {
+                try { CaptureOfficial(g, path, sha); }
+                catch (Exception e) { CaptureFailed.Add(sha); log("공식 원본 보관 실패: " + e.Message); }
+            }
             var layout = store.LayoutFor(sha);
             if (layout == null)
             {
@@ -142,20 +151,38 @@ namespace SnqxKR
 
         private static string Head(string sha) => sha.Length > 16 ? sha.Substring(0, 16) : sha;
 
-        /// <summary>게임 폴더의 공식 원본을 앱 데이터로 가져와 둔다. 번역 메모리를 만들고, 업데이트 후 복구할 때 쓴다.</summary>
+        /// <summary>
+        /// 게임 폴더의 공식 원본을 앱 데이터로 가져와 둔다. 번역 메모리를 만들고, 업데이트 후 복구할 때 쓴다.
+        /// 옆 파일에 받아 해시·버전 지문까지 확인한 뒤 바꾼다 (실패해도 전에 보관한 원본과 기록이 어긋나지 않게).
+        /// </summary>
         private void CaptureOfficial(GameInstall g, string path, string sha)
         {
             var t = store.For(g.GameDir);
             Directory.CreateDirectory(Path.GetDirectoryName(t.OfficialFile)!);
-            File.Copy(path, t.OfficialFile, true);
-            if (PatchSource.Sha256(t.OfficialFile) != sha) { log("공식 원본 보관 검증 실패"); return; }
-            var layout = engine.LayoutKey(t.OfficialFile);
+            var tmp = t.OfficialFile + ".new";
+            string layout;
+            try
+            {
+                File.Copy(path, tmp, true);
+                if (PatchSource.Sha256(tmp) != sha) { log("공식 원본 보관 검증 실패"); return; }
+                layout = engine.LayoutKey(tmp);
+                if (File.Exists(t.OfficialFile)) File.Delete(t.OfficialFile);
+                File.Move(tmp, t.OfficialFile);
+            }
+            finally
+            {
+                if (File.Exists(tmp)) File.Delete(tmp);
+            }
             t.OfficialSha = sha;
             t.OfficialLayout = layout;
             store.PutLayout(sha, layout);
             log("게임 공식 원본 보관 (버전 지문 " + Short(layout) + ")");
-            // 같은 버전 한패를 이미 받아 뒀으면 바로 번역 메모리에 넣는다
-            if (File.Exists(store.CacheFile) && PatchLayout() == layout) BuildMemory(t.OfficialFile, store.CacheFile, store.CachedSha);
+            // 같은 버전 한패를 이미 받아 뒀으면 바로 번역 메모리에 넣는다 (실패해도 보관은 끝났다. 적용할 때 다시 한다)
+            if (File.Exists(store.CacheFile) && PatchLayout() == layout)
+            {
+                try { BuildMemory(t.OfficialFile, store.CacheFile, store.CachedSha); }
+                catch (Exception e) { log("번역 메모리 갱신 실패: " + e.Message); }
+            }
         }
 
         /// <summary>받아 둔 한패의 버전 지문. 캐시를 지워도 기억해 둔 값으로 답한다.</summary>
@@ -179,7 +206,13 @@ namespace SnqxKR
         {
             if (store.MemoryPatchSha == patchSha && File.Exists(store.MemoryFile)) return;
             var tmp = store.MemoryFile + ".tmp";
-            var r = engine.BuildMemory(officialFile, patchFile, store.MemoryFile, tmp, TranslationMemory.MaxBytes);
+            MemoryBuild r;
+            try { r = engine.BuildMemory(officialFile, patchFile, store.MemoryFile, tmp, TranslationMemory.MaxBytes); }
+            catch
+            {
+                if (File.Exists(tmp)) File.Delete(tmp); // 기존 메모리는 그대로 둔다
+                throw;
+            }
             if (!r.Built)
             {
                 // 번역이 엉뚱한 원문과 짝지어져 메모리가 망가지는 것을 막는다
@@ -195,10 +228,13 @@ namespace SnqxKR
             log($"번역 메모리 갱신 · {r.Size:N0}줄");
         }
 
-        /// <summary>설치마다 처음 한 번, 게임 폴더에 있던 파일을 백업 (원본 복원용)</summary>
+        /// <summary>
+        /// 설치마다 처음 한 번, 게임 폴더의 공식 원본을 백업 (원본 복원용).
+        /// 다른 도구로 넣은 한패 같은 원본이 아닌 파일은 백업하지 않는다 (복원하면 그 한패로 돌아간다).
+        /// </summary>
         private static string? BackupIfFirst(Store.Target t, string path, Inspection info)
         {
-            if (!info.Exists || File.Exists(t.BackupFile)) return null;
+            if (!info.Exists || info.Status != PatchStatus.Official || File.Exists(t.BackupFile)) return null;
             try
             {
                 Directory.CreateDirectory(Path.GetDirectoryName(t.BackupFile)!);

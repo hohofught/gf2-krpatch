@@ -98,11 +98,13 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         // Shizuku 공식 예제대로 onCreate 에서 등록, onDestroy 에서 해제
         ShizukuBridge.addListeners()
+        // 알림으로 연 인텐트는 처음 만들 때만 따른다 (화면을 돌려 다시 만들어지면 사용자가 고른 클라이언트를 되돌리지 않게)
+        val fromLaunch = savedInstanceState == null
         setContent {
             SnqxKRTheme {
                 val model: PatchViewModel = viewModel()
                 vm = model
-                LaunchedEffect(Unit) { openFromNotice(intent) }
+                LaunchedEffect(Unit) { if (fromLaunch) openFromNotice(intent) }
                 PatchScreen(model)
             }
         }
@@ -137,7 +139,8 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         ShizukuBridge.removeListeners()
-        if (isFinishing) ShizukuBridge.unbind()
+        // 적용·복구가 도는 중이면 그 작업이 끝난 뒤에 내린다 (복사 도중에 내리면 게임 파일이 반쯤 쓰인다)
+        if (isFinishing) ShizukuBridge.unbindWhenIdle()
     }
 }
 

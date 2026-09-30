@@ -30,7 +30,7 @@ import java.util.concurrent.TimeUnit
  *  - 네트워크 연결 + 배터리·저장공간 부족 아님 조건, flex 로 시스템이 다른 작업과 묶어 실행
  *  - 바뀐 게 없으면 한패는 HEAD(0바이트), 게임 파일은 크기·수정시각만 본다 (해시·본문 읽기 생략)
  *  - 볼 클라이언트가 없거나 알림이 전부 꺼져 있으면 Shizuku 를 깨우지 않는다
- *  - 끝나면 Shizuku 특권 프로세스를 내린다 (화면이 떠 있을 때는 그대로 둔다)
+ *  - 끝나면 Shizuku 특권 프로세스를 내린다 (화면이 떠 있거나 화면의 작업이 도는 중이면 그 뒤로 미룬다)
  *  - 옛 한패를 받는 번역 메모리 준비 같은 무거운 일은 하지 않는다 (앱에서 버튼으로만)
  */
 class PatchCheckWorker(context: Context, params: WorkerParameters) : CoroutineWorker(context, params) {
@@ -44,8 +44,7 @@ class PatchCheckWorker(context: Context, params: WorkerParameters) : CoroutineWo
         if (!isMetered(applicationContext) || repo.allowMobileData) {
             engine.sync()
         } else {
-            val remote = repo.remoteEtag()
-            repo.remotePending = remote != null && remote != repo.etag
+            engine.checkRemote() // 앱을 열 때와 같은 규칙 (실패하면 전에 본 값을 둔다)
         }
 
         // 2) 게임 폴더: 이 앱으로 한패를 쓴 적 있는 클라이언트만, 알림이 하나라도 켜져 있을 때만
@@ -66,16 +65,20 @@ class PatchCheckWorker(context: Context, params: WorkerParameters) : CoroutineWo
             }
             return done(repo, "한패만 확인 · Shizuku 가 꺼져 있어 게임 폴더는 못 봄")
         }
-        try {
-            val svc = ShizukuBridge.bind().getOrNull() ?: return done(repo, "한패만 확인 · Shizuku 연결 실패")
-            for (game in watched) {
-                val info = engine.inspect(svc, game.pkg) ?: continue
-                Notices.decide(engine, game, info, patchLayout)?.let { Notices.post(applicationContext, repo, game, it) }
+        val note = try {
+            ShizukuBridge.holding {
+                val svc = ShizukuBridge.bind().getOrNull() ?: return@holding "한패만 확인 · Shizuku 연결 실패"
+                for (game in watched) {
+                    val info = engine.inspect(svc, game.pkg) ?: continue
+                    Notices.decide(engine, game, info, patchLayout)?.let { Notices.post(applicationContext, repo, game, it) }
+                }
+                "한패·게임 폴더 확인"
             }
         } finally {
-            if (!ShizukuBridge.uiVisible) ShizukuBridge.unbind()
+            // 화면이 적용·복구 중이면 그 작업이 끝난 뒤에 내린다
+            ShizukuBridge.unbindWhenIdle()
         }
-        return done(repo, "한패·게임 폴더 확인")
+        return done(repo, note)
     }
 
     private fun done(repo: PatchRepository, note: String): Result {

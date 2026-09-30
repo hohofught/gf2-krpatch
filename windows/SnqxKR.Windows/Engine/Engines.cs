@@ -77,7 +77,8 @@ namespace SnqxKR.Engine
             TranslationMemory? old = null;
             if (memoryIn != null && File.Exists(memoryIn))
             {
-                try { old = TranslationMemory.Read(memoryIn); } catch { old = null; }
+                // 깨진 옛 메모리만 버리고 새로 만든다. 메모리 부족·읽기 오류는 그대로 실패시켜 쌓아 둔 메모리를 지킨다 (Kotlin·C++ 와 같음)
+                try { old = TranslationMemory.Read(memoryIn); } catch (InvalidDataException) { old = null; }
             }
             var full = old?.MergedWith(fresh) ?? fresh;
             var cut = full.Capped(maxBytes);

@@ -107,6 +107,16 @@ class PatchEngine(context: Context) {
 
     suspend fun patchLayout(): String = LOCK.withLock { withContext(Dispatchers.IO) { patchLayoutLocked() } }
 
+    /**
+     * 서버에 아직 받지 않은 새 한패가 있는지만 본다 (HEAD, 본문 0바이트). 화면과 백그라운드 확인이 같이 쓴다.
+     * 받아 둔 한패가 없으면 새 한패가 있는 것으로 본다. 실패하면 null 이고 전에 본 값을 그대로 둔다.
+     */
+    suspend fun checkRemote(): Boolean? {
+        val remote = withContext(Dispatchers.IO) { repo.remoteEtag() } ?: return null
+        // 그사이 sync 가 한패를 받아 etag 를 바꿨을 수 있어 판단은 LOCK 안에서 한다
+        return LOCK.withLock { (repo.cachedSha.isEmpty() || remote != repo.etag).also { repo.remotePending = it } }
+    }
+
     /** force: 자리 검사에 걸린 한패도 사용자가 원하면 넣는다 (번역 메모리에는 넣지 않는다) */
     suspend fun apply(svc: IFileService, pkg: String, log: (String) -> Unit = {}, force: Boolean = false): ApplyOutcome =
         LOCK.withLock { withContext(Dispatchers.IO) { applyLocked(svc, pkg, log, force) } }
@@ -116,6 +126,18 @@ class PatchEngine(context: Context) {
 
     suspend fun restoreBackup(svc: IFileService, pkg: String, log: (String) -> Unit = {}): RestoreOutcome =
         LOCK.withLock { withContext(Dispatchers.IO) { restoreLocked(svc, pkg, log) } }
+
+    /** 게임 폴더의 한패 파일을 지운다 (게임이 다시 받아 중국어로 돌아간다). 못 지우면 이유, 지웠으면 null */
+    suspend fun removePatch(svc: IFileService, pkg: String): String? = LOCK.withLock {
+        withContext(Dispatchers.IO) {
+            if (svc.isRunning(pkg)) return@withContext "게임이 실행 중입니다. 완전히 종료한 뒤 제거하세요"
+            svc.deleteFile(Paths.targetFile(pkg))?.let { return@withContext it }
+            val t = repo.target(pkg)
+            t.appliedSha = ""
+            t.repairedSha = ""
+            null
+        }
+    }
 
     suspend fun bootstrapMemory(log: (String) -> Unit = {}): Boolean =
         LOCK.withLock { withContext(Dispatchers.IO) { bootstrapLocked(log) } }
@@ -158,7 +180,11 @@ class PatchEngine(context: Context) {
             else -> PatchStatus.FOREIGN
         }
         if (sha.isNotEmpty()) t.seen = "$stamp|$sha|${hangul ?: -2}"
-        if (status == PatchStatus.OFFICIAL && t.officialSha != sha) captureOfficial(svc, pkg, path, sha, log)
+        // 보관에 실패해도 상태 확인은 계속한다. 같은 파일로 56MB 복사를 되풀이하지 않게 이 프로세스 동안 기억한다
+        if (status == PatchStatus.OFFICIAL && t.officialSha != sha && sha !in captureFailed) {
+            runCatching { captureOfficial(svc, pkg, path, sha, log) }
+                .onFailure { captureFailed += sha; log("공식 원본 보관 실패: " + it.message) }
+        }
         val layout = repo.layoutFor(sha) ?: when (status) {
             PatchStatus.PATCHED_LATEST -> patchLayoutLocked()
             else -> svc.tableLayout(path).orEmpty()
@@ -218,20 +244,33 @@ class PatchEngine(context: Context) {
         return Inspection(true, sha, size, modified, false, -1, status, layout, a?.ok, a?.ratio ?: -1.0)
     }
 
-    /** 게임 폴더의 공식 원본을 앱으로 가져와 둔다. 번역 메모리를 만들고, 업데이트 후 복구할 때 쓴다. */
+    /**
+     * 게임 폴더의 공식 원본을 앱으로 가져와 둔다. 번역 메모리를 만들고, 업데이트 후 복구할 때 쓴다.
+     * 옆 파일에 받아 해시·버전 지문까지 확인한 뒤 바꾼다 (실패해도 전에 보관한 원본과 기록이 어긋나지 않게).
+     */
     private fun captureOfficial(svc: IFileService, pkg: String, path: String, sha: String, log: (String) -> Unit) {
         val t = repo.target(pkg)
         val dst = t.officialFile
         dst.parentFile?.mkdirs()
-        svc.copyFile(path, dst.absolutePath)?.let { log("공식 원본 보관 실패: $it"); return }
-        if (repo.sha256(dst) != sha) { log("공식 원본 보관 검증 실패"); return }
-        val layout = eng.layoutKey(dst)
+        val tmp = File(dst.path + ".new")
+        val layout = try {
+            svc.copyFile(path, tmp.absolutePath)?.let { log("공식 원본 보관 실패: $it"); return }
+            if (repo.sha256(tmp) != sha) { log("공식 원본 보관 검증 실패"); return }
+            eng.layoutKey(tmp).also {
+                if (!tmp.renameTo(dst)) tmp.copyTo(dst, overwrite = true)
+            }
+        } finally {
+            tmp.delete()
+        }
         t.officialSha = sha
         t.officialLayout = layout
         repo.putLayout(sha, layout)
         log("게임 공식 원본 보관 (버전 지문 ${layout.substringAfter(':').take(8)})")
-        // 같은 버전 한패를 이미 받아 뒀으면 바로 번역 메모리에 넣는다
-        if (repo.cacheFile.isFile && patchLayoutLocked() == layout) buildMemory(dst, repo.cacheFile, repo.cachedSha, log)
+        // 같은 버전 한패를 이미 받아 뒀으면 바로 번역 메모리에 넣는다 (실패해도 보관은 끝났다. 적용할 때 다시 한다)
+        if (repo.cacheFile.isFile && patchLayoutLocked() == layout) {
+            runCatching { buildMemory(dst, repo.cacheFile, repo.cachedSha, log) }
+                .onFailure { log("번역 메모리 갱신 실패: " + it.message) }
+        }
     }
 
     /** 받아 둔 한패의 버전 지문. 캐시를 지워도 기억해 둔 값으로 답한다. */
@@ -252,7 +291,12 @@ class PatchEngine(context: Context) {
     private fun buildMemory(officialFile: File, patchFile: File, patchSha: String, log: (String) -> Unit): Boolean {
         if (repo.memoryPatchSha == patchSha && repo.memoryFile.isFile) return true
         val tmp = File(repo.memoryFile.path + ".tmp")
-        val r = eng.buildMemory(officialFile, patchFile, repo.memoryFile, tmp, TranslationMemory.MAX_BYTES)
+        val r = try {
+            eng.buildMemory(officialFile, patchFile, repo.memoryFile, tmp, TranslationMemory.MAX_BYTES)
+        } catch (t: Throwable) {
+            tmp.delete() // 기존 메모리는 그대로 둔다
+            throw t
+        }
         if (!r.built) {
             tmp.delete()
             log("한패가 공식 원문과 자리가 맞지 않아 번역 메모리에 넣지 않았습니다 (${percent(r.alignment.ratio)} 일치)")
@@ -270,9 +314,12 @@ class PatchEngine(context: Context) {
         return true
     }
 
-    /** 클라이언트마다 처음 한 번, 게임 폴더에 있던 파일을 백업 (원본 복원용) */
+    /**
+     * 클라이언트마다 처음 한 번, 게임 폴더의 공식 원본을 백업 (원본 복원용).
+     * 다른 도구로 넣은 한패 같은 원본이 아닌 파일은 백업하지 않는다 (복원하면 그 한패로 돌아간다).
+     */
     private fun backupIfFirst(svc: IFileService, path: String, info: Inspection, t: PatchRepository.Target): String? {
-        if (!info.exists || t.backupFile.isFile) return null
+        if (!info.exists || info.status != PatchStatus.OFFICIAL || t.backupFile.isFile) return null
         t.backupFile.parentFile?.mkdirs()
         return svc.copyFile(path, t.backupFile.absolutePath)
     }
@@ -284,7 +331,9 @@ class PatchEngine(context: Context) {
         if (!src.isFile || srcSha.isEmpty()) return ApplyOutcome.NoPatch
         val info = inspectLocked(svc, pkg, log) ?: return ApplyOutcome.Failed("게임 폴더를 읽지 못했습니다")
         val patchLayout = patchLayoutLocked()
-        if (info.gameLayout.isNotEmpty() && patchLayout.isNotEmpty() && info.gameLayout != patchLayout) {
+        // 받아 둔 한패를 표로 읽지 못하면 버전을 확인할 수 없으므로 넣지 않는다
+        if (patchLayout.isEmpty()) return ApplyOutcome.Failed("받아 둔 한패를 읽을 수 없습니다. 업데이트 확인으로 다시 받으세요")
+        if (info.gameLayout.isNotEmpty() && info.gameLayout != patchLayout) {
             return ApplyOutcome.VersionMismatch
         }
         // 버전은 맞아도 번역이 엉뚱한 자리에 들어간 한패는 넣지 않는다 (같은 버전 공식 원문이 있을 때만 알 수 있다)
@@ -529,6 +578,9 @@ class PatchEngine(context: Context) {
     companion object {
         /** 화면과 백그라운드 작업이 게임 폴더·캐시·번역 메모리를 동시에 건드리지 않게 한다 */
         private val LOCK = Mutex()
+
+        /** 보관하다 실패한 공식 원본의 해시 (LOCK 안에서만). 프로세스가 다시 뜨면 한 번 더 해 본다 */
+        private val captureFailed = mutableSetOf<String>()
 
         /** 본문 앞 2MB 면 수천 줄이라 한패와 원본을 가르기에 충분하다 */
         const val HANGUL_SAMPLE_BYTES = 2 * 1024 * 1024

@@ -41,7 +41,14 @@ object KotlinEngine : Engine {
         val a = PatchRepair.alignment(o, p)
         if (a.ok == false) return MemoryBuild(false, 0, 0, a)
         val fresh = TranslationMemory.build(o, p)
-        val old = if (memoryIn != null && memoryIn.isFile) runCatching { TranslationMemory.read(memoryIn) }.getOrNull() else null
+        // 깨진 옛 메모리만 버리고 새로 만든다. 메모리 부족·읽기 오류는 그대로 실패시켜 쌓아 둔 메모리를 지킨다 (C++·C# 과 같음)
+        val old = if (memoryIn != null && memoryIn.isFile) {
+            try {
+                TranslationMemory.read(memoryIn)
+            } catch (e: CorruptMemoryException) {
+                null
+            }
+        } else null
         val full = old?.mergedWith(fresh) ?: fresh
         val cut = full.capped(maxBytes)
         writing(memoryOut, official, patch, memoryIn) { cut.writeTo(it) }

@@ -5,6 +5,7 @@ import android.net.ConnectivityManager
 import androidx.lifecycle.AndroidViewModel
 import com.hoho.snqxkr.langtable.Engines
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -128,6 +129,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 targetSha = if (switched) "" else it.targetSha,
             ).withStored()
         }
+        refreshDiskStats()
         if (chosen == null) {
             log("소전2 중섭 클라이언트를 찾지 못했습니다")
             return@launch
@@ -142,10 +144,20 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
      * 큰 버튼이 "새 한패 받아서 적용" 을 고를 수 있게 한다. 네트워크가 없으면 전에 본 값을 그대로 쓴다.
      */
     private fun checkRemoteQuietly() = viewModelScope.launch {
-        val remote = withContext(Dispatchers.IO) { repo.remoteEtag() } ?: return@launch
-        val pending = repo.cachedSha.isEmpty() || remote != repo.etag
-        repo.remotePending = pending
+        val pending = engine.checkRemote() ?: return@launch
         _ui.update { it.copy(remotePending = pending) }
+    }
+
+    /** 디스크를 훑어야 아는 값 (1.0 원본 백업의 한글 검사는 백업마다 최대 2MB, 캐시 폴더 크기). 메인 스레드에서 구하지 않는다 */
+    private class DiskStats(val canBootstrap: Boolean, val storage: PatchEngine.Storage)
+
+    @Volatile
+    private var diskStats = DiskStats(false, PatchEngine.Storage(0, 0, 0, 0))
+
+    private suspend fun refreshDiskStats() {
+        val s = withContext(Dispatchers.IO) { DiskStats(engine.canBootstrap(), engine.storage()) }
+        diskStats = s
+        _ui.update { it.copy(canBootstrap = s.canBootstrap, storage = s.storage) }
     }
 
     private var autoMemoryTried = false
@@ -155,7 +167,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
      * 약 50MB 를 받으므로 Wi-Fi 이거나 모바일 데이터를 허용했을 때만. Shizuku 는 필요 없다.
      */
     private fun maybePrepareMemory() {
-        if (autoMemoryTried || _ui.value.busy || !engine.canBootstrap()) return
+        if (autoMemoryTried || _ui.value.busy || !diskStats.canBootstrap) return
         val cm = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
         if (cm?.activeNetwork == null) return
         if (cm.isActiveNetworkMetered && !repo.allowMobileData) return
@@ -164,7 +176,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         prepareMemory()
     }
 
-    /** 저장된 기록·설정을 화면 상태에 옮긴다 */
+    /** 저장된 기록·설정을 화면 상태에 옮긴다 (디스크를 훑는 값은 [refreshDiskStats] 가 IO 에서 구해 둔 것) */
     private fun UiState.withStored(): UiState {
         val t = gamePkg?.let { repo.target(it) }
         return copy(
@@ -178,8 +190,8 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             repairedCoverage = t?.repairedCoverage ?: -1f,
             memorySize = if (repo.memoryFile.isFile) repo.memorySize else 0,
             memoryAt = repo.memoryAt,
-            canBootstrap = engine.canBootstrap(),
-            storage = engine.storage(),
+            canBootstrap = diskStats.canBootstrap,
+            storage = diskStats.storage,
             engineName = engine.engineName,
             engineFallback = Engines.fallbackReason,
             autoCheck = repo.autoCheck,
@@ -248,7 +260,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** 게임 폴더의 현재 상태를 읽어 status 를 갱신 */
-    fun inspectTarget() = viewModelScope.launch { inspectTargetInternal() }
+    fun inspectTarget() = viewModelScope.launch { ShizukuBridge.holding { inspectTargetInternal() } }
 
     private suspend fun inspectTargetInternal() {
         val pkg = _ui.value.gamePkg ?: return
@@ -426,14 +438,13 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
     fun removePatch() = launchTask(busyLabel = "패치 제거 중") {
         val pkg = _ui.value.gamePkg ?: return@launchTask
         val svc = service() ?: return@launchTask
-        val err = withContext(Dispatchers.IO) { svc.deleteFile(Paths.targetFile(pkg)) }
+        val err = engine.removePatch(svc, pkg)
         if (err == null) {
-            repo.target(pkg).appliedSha = ""
-            repo.target(pkg).repairedSha = ""
             log("패치 파일 삭제 완료 (게임이 다시 중국어로 돌아갑니다)")
             _ui.update { it.copy(snack = "패치 파일을 삭제했습니다") }
         } else {
-            log("삭제 실패 · " + err)
+            log("삭제 안 함 · " + err)
+            _ui.update { it.copy(snack = err) }
         }
         inspectTargetInternal()
     }
@@ -484,12 +495,16 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         if (_ui.value.busy) return@launch
         _ui.update { it.copy(busy = true, busyLabel = busyLabel) }
         try {
-            block()
+            // 게임 폴더를 쓰는 동안 백그라운드 작업·화면 닫기가 특권 프로세스를 내리지 않게 붙잡는다
+            ShizukuBridge.holding { block() }
+        } catch (e: CancellationException) {
+            throw e
         } catch (t: Throwable) {
             log("오류: " + t)
         } finally {
             _ui.update { it.copy(busy = false, busyLabel = "", progress = -1f, progressText = "").withStored() }
         }
+        refreshDiskStats()
     }
 
     companion object {

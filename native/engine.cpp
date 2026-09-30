@@ -37,6 +37,11 @@ struct Error : std::runtime_error {
     using std::runtime_error::runtime_error;
 };
 
+/** 번역 메모리 형식이 아닌 파일 (깨졌거나 잘림). 합칠 때 이것만 버리고 새로 만든다 (Kotlin CorruptMemoryException·C# InvalidDataException 과 같다) */
+struct Corrupt : Error {
+    using Error::Error;
+};
+
 /** [0, n) 을 최대 4개 스레드로 나눠 f(시작, 끝). 작으면 한 스레드. f 는 예외를 던지지 않아야 한다. */
 template <class F>
 void parallel_for(size_t n, F&& f) {
@@ -45,9 +50,16 @@ void parallel_for(size_t n, F&& f) {
     if (t <= 1 || n < 65536) { f(size_t(0), n); return; }
     size_t chunk = (n + t - 1) / t;
     std::vector<std::thread> threads;
+    threads.reserve(t - 1);
     for (unsigned i = 1; i < t; i++) {
         size_t b = i * chunk, e = std::min(n, b + chunk);
-        if (b < e) threads.emplace_back([&f, b, e] { f(b, e); });
+        if (b >= e) continue;
+        try {
+            threads.emplace_back([&f, b, e] { f(b, e); });
+        } catch (...) {
+            // 스레드를 못 만들면(메모리 압박) 이 몫은 여기서 한다. 예외를 내보내면 합류 안 한 스레드 때문에 std::terminate 로 죽는다
+            f(b, e);
+        }
     }
     f(size_t(0), std::min(n, chunk));
     for (auto& th : threads) th.join();
@@ -721,14 +733,14 @@ struct Memory {
 Memory read_memory(const Blob& blob) {
     const uint8_t* b = blob.data();
     const size_t size = blob.size();
-    if (size < 8) throw Error("번역 메모리 파일이 아닙니다");
+    if (size < 8) throw Corrupt("번역 메모리 파일이 아닙니다");
     uint32_t be = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
     uint32_t le = uint32_t(b[0]) | uint32_t(b[1]) << 8 | uint32_t(b[2]) << 16 | uint32_t(b[3]) << 24;
     bool big = be == MAGIC_V1 || be == MAGIC_V2;
     uint32_t magic = big ? be : le;
-    if (magic != MAGIC_V1 && magic != MAGIC_V2) throw Error("번역 메모리 파일이 아닙니다");
+    if (magic != MAGIC_V1 && magic != MAGIC_V2) throw Corrupt("번역 메모리 파일이 아닙니다");
     size_t p = 4;
-    auto need = [&](size_t k) { if (k > size - p) throw Error("번역 메모리 파일이 끊김"); };
+    auto need = [&](size_t k) { if (k > size - p) throw Corrupt("번역 메모리 파일이 끊김"); };
     auto u32 = [&]() -> uint32_t {
         need(4);
         uint32_t v = big ? (uint32_t(b[p]) << 24 | uint32_t(b[p + 1]) << 16 | uint32_t(b[p + 2]) << 8 | b[p + 3])
@@ -742,7 +754,7 @@ Memory read_memory(const Blob& blob) {
     };
     Memory m;
     uint32_t n = u32();
-    if (n > size / 12) throw Error("번역 메모리 줄 수가 이상함");
+    if (n > size / 12) throw Corrupt("번역 메모리 줄 수가 이상함");
     m.keys.resize(n); m.values.resize(n); m.gens.resize(n);
     for (uint32_t i = 0; i < n; i++) {
         m.keys[i] = int64_t(u64());
@@ -1082,8 +1094,8 @@ SNQX_API int snqx_build_memory(const char* official, const char* patch, const ch
                     Memory old = read_memory(*old_blob);
                     merged = merge(old, fresh);
                     have_old = true;
-                } catch (const Error&) {
-                    // 읽을 수 없는 옛 메모리는 버리고 새로 만든다 (Kotlin·C# 과 같음)
+                } catch (const Corrupt&) {
+                    // 깨진 옛 메모리만 버리고 새로 만든다. 열기 실패·메모리 부족은 그대로 실패시켜 쌓아 둔 메모리를 지킨다 (Kotlin·C# 과 같음)
                 }
             }
             if (!have_old) merged = std::move(fresh);

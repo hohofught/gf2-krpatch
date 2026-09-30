@@ -173,12 +173,13 @@ namespace SnqxKR.Engine
         /// <summary>
         /// 파일을 한 번에 읽는다. 번역은 복사하지 않고 그 안의 자리만 든다.
         /// 첫 4바이트로 형식을 가린다: 0.2 윈도우판은 리틀엔디안 "SNQM" 을 썼고, 이제는 안드로이드와 같은 빅엔디안이다.
+        /// 깨졌거나 잘린 파일은 <see cref="InvalidDataException"/> 하나로 알린다 (Kotlin CorruptMemoryException·C++ Corrupt 와 같다).
         /// </summary>
         public static TranslationMemory Read(string path)
         {
             var b = File.ReadAllBytes(path);
             int p = 0;
-            void Need(int k) { if (k > b.Length - p) throw new EndOfStreamException("번역 메모리 파일이 끊김"); }
+            void Need(int k) { if (k > b.Length - p) throw new InvalidDataException("번역 메모리 파일이 끊김"); }
             Need(4);
             int be = (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3];
             int le = b[0] | (b[1] << 8) | (b[2] << 16) | (b[3] << 24);
