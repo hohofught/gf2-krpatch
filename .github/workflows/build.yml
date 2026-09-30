@@ -26,15 +26,18 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
-      # native 판(libsnqx.so)을 빌드할 NDK·CMake (app/build.gradle.kts 의 ndkVersion 과 같게)
-      - name: Install NDK and CMake
-        run: sdkmanager --install "ndk;30.0.16248370" "cmake;4.1.2" > /dev/null
+      # 러너에 이미 깔린 Android SDK 를 쓴다. android-actions/setup-android@v3 는 2026-09 러너(cmdline-tools 16.0)에서
+      # 라이선스 동의 단계가 exit 1 로 끝나 빌드 전에 멈췄다.
+      # native 판(libsnqx.so)을 빌드할 NDK·CMake 는 app/build.gradle.kts 의 ndkVersion·cmake version 과 같게.
+      - name: Android SDK licenses, NDK and CMake
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          echo "sdkmanager: $SDKM"
+          yes | "$SDKM" --licenses > /dev/null || true
+          "$SDKM" --install "platforms;android-37.0" "ndk;30.0.16248370" "cmake;4.1.2" > /dev/null
 
       - name: Decode signing key
         if: env.RELEASE_KEYSTORE_B64 != ''
