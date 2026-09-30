@@ -25,35 +25,94 @@ namespace SnqxKR
     {
         public sealed class VolumeStats
         {
-            public VolumeStats(string drive, long records, long milliseconds, int hits)
+            public VolumeStats(string drive, long records, long milliseconds, int hits, string? error = null)
             {
                 Drive = drive;
                 Records = records;
                 Milliseconds = milliseconds;
                 Hits = hits;
+                Error = error;
             }
 
             public string Drive { get; }
             public long Records { get; }
             public long Milliseconds { get; }
             public int Hits { get; }
+            /// <summary>훑지 못한 이유 (성공하면 null)</summary>
+            public string? Error { get; }
         }
 
-        public static List<string> Find(string[] names, List<VolumeStats> stats)
+        /// <summary>스캔 화면에 보일 루트 드라이브 하나</summary>
+        public sealed class DriveChoice
+        {
+            public DriveChoice(string drive, bool isFixed, string label, string format, long size, string? unavailable)
+            {
+                Drive = drive;
+                IsFixed = isFixed;
+                Label = label;
+                Format = format;
+                Size = size;
+                Unavailable = unavailable;
+            }
+
+            /// <summary>"C:" 꼴</summary>
+            public string Drive { get; }
+            public bool IsFixed { get; }
+            public string Label { get; }
+            public string Format { get; }
+            public long Size { get; }
+            /// <summary>MFT 로 훑을 수 없는 이유 (훑을 수 있으면 null)</summary>
+            public string? Unavailable { get; }
+            public bool Scannable => Unavailable == null;
+        }
+
+        /// <summary>
+        /// 고를 수 있는 루트 드라이브: 고정·이동식 드라이브. MFT 는 NTFS 에만 있어 FAT·exFAT 등은 훑을 수 없다고 표시한다.
+        /// 네트워크·광학 드라이브는 넣지 않는다.
+        /// </summary>
+        public static List<DriveChoice> Drives()
+        {
+            var list = new List<DriveChoice>();
+            foreach (var d in DriveInfo.GetDrives())
+            {
+                if (d.DriveType != DriveType.Fixed && d.DriveType != DriveType.Removable) continue;
+                string drive = d.Name.Substring(0, 2).ToUpperInvariant();
+                bool isFixed = d.DriveType == DriveType.Fixed;
+                try
+                {
+                    if (!d.IsReady) { list.Add(new DriveChoice(drive, isFixed, "", "", 0, "준비되지 않은 드라이브")); continue; }
+                    string format = d.DriveFormat;
+                    list.Add(new DriveChoice(drive, isFixed, d.VolumeLabel, format, d.TotalSize,
+                        format == "NTFS" ? null : format + " 드라이브는 파일 목록(MFT)이 없어 훑을 수 없음"));
+                }
+                catch (Exception e)
+                {
+                    list.Add(new DriveChoice(drive, isFixed, "", "", 0, e.Message));
+                }
+            }
+            return list.OrderBy(c => c.Drive, StringComparer.OrdinalIgnoreCase).ToList();
+        }
+
+        /// <param name="drives">훑을 드라이브 ("C:" 꼴). null 이면 고정 NTFS 드라이브 전부</param>
+        public static List<string> Find(string[] names, List<VolumeStats> stats, IReadOnlyCollection<string>? drives = null)
         {
             // 비교용: 소문자 UTF-16LE 바이트 (NTFS 이름은 UTF-16)
             var targets = names.Select(n => Encoding.Unicode.GetBytes(n.ToLowerInvariant())).ToArray();
-            var drives = DriveInfo.GetDrives()
-                .Where(d => { try { return d.DriveType == DriveType.Fixed && d.IsReady && d.DriveFormat == "NTFS"; } catch { return false; } })
-                .Select(d => d.Name.Substring(0, 2))
-                .ToList();
+            var choices = Drives();
+            var pick = drives == null
+                ? choices.Where(c => c.IsFixed && c.Scannable).Select(c => c.Drive).ToList()
+                : drives.Select(d => d.ToUpperInvariant()).Distinct().ToList();
             var result = new List<string>();
             var gate = new object();
-            Parallel.ForEach(drives, drive =>
+            Parallel.ForEach(pick, drive =>
             {
+                var sw = Stopwatch.StartNew();
                 try
                 {
-                    var sw = Stopwatch.StartNew();
+                    // 고른 뒤에 바뀌었을 수 있어 다시 확인한다 (없어진 드라이브·NTFS 아님)
+                    var choice = choices.FirstOrDefault(c => c.Drive == drive);
+                    if (choice == null) throw new IOException("드라이브가 없음");
+                    if (!choice.Scannable) throw new IOException(choice.Unavailable);
                     var (paths, records) = ScanVolume(drive, targets);
                     lock (gate)
                     {
@@ -61,9 +120,10 @@ namespace SnqxKR
                         stats.Add(new VolumeStats(drive, records, sw.ElapsedMilliseconds, paths.Count));
                     }
                 }
-                catch
+                catch (Exception e)
                 {
-                    // 한 드라이브가 실패해도 나머지는 본다
+                    // 한 드라이브가 실패해도 나머지는 본다. 이유는 결과에 남긴다
+                    lock (gate) stats.Add(new VolumeStats(drive, 0, sw.ElapsedMilliseconds, 0, e.Message));
                 }
             });
             return result;

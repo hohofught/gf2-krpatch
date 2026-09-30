@@ -24,7 +24,7 @@ dotnet build windows/SnqxKR.Windows/SnqxKR.Windows.csproj -c Release -p:Engine=N
 
 ## 화면
 
-1. **한글패치할 게임을 선택하세요**: 찾은 설치 목록. 중섭이 아닌 설치는 흐리게 보이고 선택할 수 없다. 다시 찾기 · 실행 파일 직접 선택 · 관리자 권한으로 전체 스캔.
+1. **한글패치할 게임을 선택하세요**: 찾은 설치 목록. 중섭이 아닌 설치는 흐리게 보이고 선택할 수 없다. 다시 찾기 · 실행 파일 직접 선택 · 관리자 권한으로 전체 스캔. 옆의 작은 ▾ (고급 설정)에서 훑을 루트 드라이브를 체크로 고른다 (처음에는 고정 NTFS 드라이브 전부, 바꾸면 바로 기억한다).
 2. **선택한 게임**: 상태와 주 버튼(한글패치 적용 / 임시 복구 / 정식 한패로 교체), 업데이트 확인, 원본 복원, 게임 버전·한패·번역 메모리·백업 정보.
 3. **저장 공간**: 항목별 크기와 삭제, 데이터 폴더 열기.
    - 캐시(받은 한패·임시 복구본): 다시 받거나 만들 수 있어 바로 지운다. 해시·버전 기록은 남아 상태 판정은 그대로다.
@@ -48,7 +48,7 @@ dotnet build windows/SnqxKR.Windows/SnqxKR.Windows.csproj -c Release -p:Engine=N
 
 | 명령 | 언제 | 하는 일 |
 |---|---|---|
-| `--scan <결과파일>` | "관리자 권한으로 전체 스캔" | NTFS MFT(`FSCTL_ENUM_USN_DATA`)로 모든 고정 NTFS 드라이브에서 `GF2_Exilium.exe`·`PCLauncher.exe` 를 찾는다. 폴더를 하나씩 열지 않아 몇 초면 끝난다. 찾은 폴더도 중섭 확인을 거친다 |
+| `--scan <결과파일> [C: D: ...]` | "관리자 권한으로 전체 스캔" (드라이브는 옆 ▾ 고급 설정) | NTFS MFT(`FSCTL_ENUM_USN_DATA`)로 고른 드라이브(없으면 고정 NTFS 드라이브 전부)에서 `GF2_Exilium.exe`·`PCLauncher.exe` 를 찾는다. 폴더를 하나씩 열지 않아 몇 초면 끝난다. 찾은 폴더도 중섭 확인을 거친다. 인자는 드라이브 글자(`X:`)만 받는다. 훑지 못한 드라이브는 이유를 결과에 남겨 기록에 보인다 (예전에는 조용히 빠졌다). 고정·이동식 드라이브 중 NTFS 가 아닌 것(FAT·exFAT)은 MFT 가 없어 고를 수 없다 |
 | `--copy <원본> <대상>` | 게임 폴더에 쓸 권한이 없을 때 (B服 기본 경로 `Program Files`) | 대상이 중섭으로 확인된 게임 폴더의 `LangPackageTableCnData.bytes` 일 때만 복사 |
 
 ## 중섭 전용 (`CnServerCheck`)
@@ -87,6 +87,7 @@ dotnet build windows/SnqxKR.Windows/SnqxKR.Windows.csproj -c Release -p:Engine=N
 | 바탕화면·시작 메뉴 `.lnk` | 런처 폴더 | `C:\GF2Exilium\PCLauncher.exe` |
 | 런처 `config.ini` `game_install_path` (官服) / `Games` (B服) | 게임 폴더 | `C:/GF2Exilium/GF2 Game` |
 | B服 기본 설치 경로 | 런처 폴더 | `C:\Program Files\bilibili Game\GF2_Exilium` |
+| Everything 색인 (Everything 이 떠 있을 때, `EverythingSearch`) | 게임·런처 실행 파일 | IPC(`WM_COPYDATA`, SDK 의 `everything_ipc.h` 규약)로 두 이름을 묻는다. 관리자 권한·디스크 훑기 없이 17 ms. 에픽 글로벌판(`Epic Games\GIRLSFRONTLINE2EXILIUM`)도 찾아 "중섭 아님"으로 보인다. Everything 이 관리자 권한으로 떠 있으면 메시지가 막혀 건너뛴다 |
 | 전에 찾은 경로 (전체 스캔·직접 선택 포함) | 게임 폴더 | 매번 재검증, 없어진 폴더는 버림, 중섭만 기억 |
 
 ## 남은 확인 사항

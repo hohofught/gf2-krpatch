@@ -57,6 +57,7 @@ namespace SnqxKR
             if (store.MigratedFrom != null) Log("이전 데이터 폴더를 옮겼습니다: " + store.MigratedFrom + " → " + store.Root);
             if (store.MigrationError != null) Log("이전 데이터 폴더를 다 옮기지 못했습니다 (다음 실행 때 다시 시도): " + store.MigrationError);
             RenderStorage();
+            UpdateScanTooltip();
         }
 
         private GameInstall? Selected => (GameList.SelectedItem as GameItem)?.Install;
@@ -67,8 +68,10 @@ namespace SnqxKR
         {
             var sw = Stopwatch.StartNew();
             var previous = Selected?.GameDir ?? store.Get("selectedDir");
-            installs = await Task.Run(() => GameLocator.LocateAll(store.KnownGameDirs));
+            string everything = "";
+            installs = await Task.Run(() => GameLocator.LocateAll(store.KnownGameDirs, s => everything = s));
             sw.Stop();
+            if (everything.Length > 0) Log(everything);
             // 확인된 중섭 설치만 기억한다 (다음에 다시 검증)
             store.KnownGameDirs = installs.Where(i => i.IsCn).Select(i => i.GameDir).ToList();
 
@@ -160,32 +163,102 @@ namespace SnqxKR
             await Run("찾는 중", LocateAsync);
         }
 
-        /// <summary>관리자 권한으로 이 exe 를 한 번 더 띄워 MFT 로 모든 드라이브를 훑는다</summary>
+        /// <summary>
+        /// 전체 스캔할 드라이브. 처음에는 고정 NTFS 드라이브 전부(예전과 같은 범위), 고급 설정(▾)에서 고른 뒤로는 그 드라이브
+        /// (지금 훑을 수 있는 것만). 저장값 "-" 는 전부 끈 것.
+        /// </summary>
+        private List<string> ScanDrives(List<MftScanner.DriveChoice> choices)
+        {
+            var saved = store.Get("scanDrives");
+            if (saved.Length == 0) return choices.Where(c => c.Scannable && c.IsFixed).Select(c => c.Drive).ToList();
+            var picked = saved.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            return choices.Where(c => c.Scannable && picked.Contains(c.Drive, StringComparer.OrdinalIgnoreCase)).Select(c => c.Drive).ToList();
+        }
+
+        /// <summary>고급 설정(▾): 전체 스캔할 루트 드라이브를 체크로 고른다. 바꾸면 바로 기억한다</summary>
+        private void ScanOptions_Click(object sender, RoutedEventArgs e) => OpenScanOptions(null);
+
+        private void OpenScanOptions(string? note)
+        {
+            var choices = MftScanner.Drives();
+            var picked = ScanDrives(choices);
+            DrivePanel.Children.Clear();
+            foreach (var d in choices)
+            {
+                var parts = new List<string> { d.Label.Length > 0 ? d.Label : "로컬 디스크" };
+                if (d.Size > 0) parts.Add(DriveSize(d.Size));
+                if (d.Format.Length > 0) parts.Add(d.Format);
+                if (!d.IsFixed) parts.Add("이동식");
+                var box = new CheckBox
+                {
+                    Content = d.Drive + "  " + string.Join(" · ", parts) + (d.Unavailable != null ? " — " + d.Unavailable : ""),
+                    Tag = d.Drive,
+                    IsEnabled = d.Scannable,
+                    IsChecked = picked.Contains(d.Drive),
+                    Margin = new Thickness(0, 0, 0, 6),
+                };
+                box.SetResourceReference(Control.ForegroundProperty, "Text");
+                box.Checked += (_, _) => SaveScanDrives();
+                box.Unchecked += (_, _) => SaveScanDrives();
+                DrivePanel.Children.Add(box);
+            }
+            ScanNote.Text = note ?? "";
+            ScanNote.Visibility = note == null ? Visibility.Collapsed : Visibility.Visible;
+            ScanOptions.IsOpen = true;
+        }
+
+        private void SaveScanDrives()
+        {
+            var drives = DrivePanel.Children.OfType<CheckBox>().Where(b => b.IsChecked == true).Select(b => (string)b.Tag).ToList();
+            store.Set("scanDrives", drives.Count > 0 ? string.Join(" ", drives) : "-");
+            ScanNote.Visibility = Visibility.Collapsed;
+        }
+
+        private void ScanOptions_Closed(object sender, EventArgs e) => UpdateScanTooltip();
+
+        private void UpdateScanTooltip()
+        {
+            var drives = ScanDrives(MftScanner.Drives());
+            ScanButton.ToolTip = "NTFS 파일 목록(MFT)을 읽어 " + (drives.Count > 0 ? string.Join(" ", drives) : "(고른 드라이브 없음)") +
+                                 " 에서 게임·런처를 찾습니다. 관리자 권한 창이 뜹니다. 드라이브는 옆의 ▾ (고급 설정)에서 고릅니다.";
+        }
+
+        /// <summary>관리자 권한으로 이 exe 를 한 번 더 띄워 고른 드라이브를 MFT 로 훑는다</summary>
         private async void Scan_Click(object sender, RoutedEventArgs e)
         {
-            await Run("전체 스캔 중 (관리자 권한 창에서 허용하세요)", async () =>
+            var drives = ScanDrives(MftScanner.Drives());
+            if (drives.Count == 0)
+            {
+                OpenScanOptions("전체 스캔할 드라이브를 하나 이상 고르세요.");
+                return;
+            }
+            await Run($"전체 스캔 중 ({string.Join(" ", drives)} · 관리자 권한 창에서 허용하세요)", async () =>
             {
                 var result = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "SnqxKR-scan-" + Guid.NewGuid().ToString("N") + ".txt");
                 var sw = Stopwatch.StartNew();
-                var code = await Task.Run(() => Elevated.Scan(result));
+                var code = await Task.Run(() => Elevated.Scan(result, drives));
                 if (code == null) { Show("관리자 권한 요청을 취소했습니다"); return; }
                 if (code != 0 || !File.Exists(result)) { Show("전체 스캔 실패 (" + code + ")"); return; }
                 var lines = File.ReadAllLines(result).Where(l => l.Trim().Length > 0).ToList();
                 File.Delete(result);
                 var total = sw.Elapsed;
-                // "#C: 레코드수 ms 찾은수" = 드라이브별 MFT 훑기 결과
+                // "#C: 레코드수 ms 찾은수" = 드라이브별 MFT 훑기 결과, "!C: 이유" = 훑지 못한 드라이브
                 var volumes = lines.Where(l => l.StartsWith("#")).Select(l => l.Substring(1).Split(' ')).Where(p => p.Length == 4).ToList();
-                var hits = lines.Where(l => !l.StartsWith("#")).ToList();
+                var failed = lines.Where(l => l.StartsWith("!")).Select(l => l.Substring(1)).ToList();
+                var hits = lines.Where(l => !l.StartsWith("#") && !l.StartsWith("!")).ToList();
                 foreach (var v in volumes)
                     Log($"  {v[0]} MFT 레코드 {long.Parse(v[1]):N0}개 · {long.Parse(v[2]) / 1000.0:0.00}초 · 찾음 {v[3]}");
-                Log($"전체 스캔: 파일 {hits.Count}개, 관리자 권한 창 포함 {total.TotalSeconds:0.0}초");
+                foreach (var f in failed) Log("  " + f.Substring(0, Math.Min(2, f.Length)) + " 훑지 못함:" + f.Substring(Math.Min(2, f.Length)));
+                Log($"전체 스캔: 드라이브 {volumes.Count}개" + (failed.Count > 0 ? $" (못 훑은 {failed.Count}개)" : "") +
+                    $", 파일 {hits.Count}개, 관리자 권한 창 포함 {total.TotalSeconds:0.0}초");
                 foreach (var h in hits) Log("  " + h);
                 // 스캔으로 찾은 폴더는 다음 찾기부터 후보로 쓴다 (중섭으로 확인된 것만 남는다)
                 store.KnownGameDirs = store.KnownGameDirs.Concat(hits.Select(h => System.IO.Path.GetDirectoryName(h)!)).ToList();
                 var locate = Stopwatch.StartNew();
                 await LocateAsync();
                 var mft = volumes.Sum(v => long.Parse(v[2])) / 1000.0;
-                Show($"전체 스캔 완료 · 게임·런처 파일 {hits.Count}개 · 디스크 훑기 {mft:0.00}초 · 확인 {locate.Elapsed.TotalSeconds:0.0}초");
+                Show($"전체 스캔 완료 · 게임·런처 파일 {hits.Count}개 · 디스크 훑기 {mft:0.00}초 · 확인 {locate.Elapsed.TotalSeconds:0.0}초" +
+                     (failed.Count > 0 ? $" · 못 훑은 드라이브 {string.Join(" ", failed.Select(f => f.Substring(0, Math.Min(2, f.Length))))} (기록 참고)" : ""));
             });
         }
 
@@ -249,7 +322,7 @@ namespace SnqxKR
             PrimaryButton.Tag = primary == "임시 복구" ? "repair" : "apply";
             PrimaryButton.IsEnabled = CheckButton.IsEnabled = !busy;
             RestoreButton.IsEnabled = !busy && File.Exists(t.BackupFile) && info.Status != PatchStatus.Official;
-            RefreshButton.IsEnabled = PickButton.IsEnabled = ScanButton.IsEnabled = !busy;
+            RefreshButton.IsEnabled = PickButton.IsEnabled = ScanButton.IsEnabled = ScanOptionsButton.IsEnabled = !busy;
             GameList.IsEnabled = !busy;
 
             var notes = new List<string>();
@@ -529,6 +602,9 @@ namespace SnqxKR
             : bytes < 1024 * 1024 ? $"{bytes / 1024.0:0.0} KB"
             : bytes < 1024L * 1024 * 1024 ? $"{bytes / 1048576.0:0.0} MB"
             : $"{bytes / 1073741824.0:0.00} GB";
+
+        private static string DriveSize(long bytes) =>
+            bytes >= 1L << 40 ? $"{bytes / (double)(1L << 40):0.0} TB" : $"{bytes / (double)(1L << 30):0} GB";
 
         private static string Time(long ms) =>
             ms <= 0 ? "없음" : DateTimeOffset.FromUnixTimeMilliseconds(ms).LocalDateTime.ToString("MM/dd HH:mm");

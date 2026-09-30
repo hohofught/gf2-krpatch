@@ -50,13 +50,31 @@
                         <WrapPanel Margin="0,4,0,0">
                             <Button x:Name="RefreshButton" Content="다시 찾기" Click="Refresh_Click" Margin="0,0,8,8" />
                             <Button x:Name="PickButton" Content="실행 파일 직접 선택" Click="Pick_Click" Margin="0,0,8,8" />
-                            <Button x:Name="ScanButton" Click="Scan_Click" Margin="0,0,8,8"
-                                    ToolTip="NTFS 파일 목록(MFT)을 읽어 모든 드라이브에서 게임·런처를 찾습니다. 관리자 권한 창이 뜹니다.">
-                                <StackPanel Orientation="Horizontal">
-                                    <TextBlock Text="&#xE7EF;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Center" Margin="0,0,6,0" />
-                                    <TextBlock Text="관리자 권한으로 전체 스캔" />
-                                </StackPanel>
-                            </Button>
+                            <StackPanel Orientation="Horizontal" Margin="0,0,8,8">
+                                <Button x:Name="ScanButton" Click="Scan_Click">
+                                    <StackPanel Orientation="Horizontal">
+                                        <TextBlock Text="&#xE7EF;" FontFamily="Segoe MDL2 Assets" VerticalAlignment="Center" Margin="0,0,6,0" />
+                                        <TextBlock Text="관리자 권한으로 전체 스캔" />
+                                    </StackPanel>
+                                </Button>
+                                <!-- 고급 설정: 훑을 루트 드라이브 고르기 -->
+                                <Button x:Name="ScanOptionsButton" Click="ScanOptions_Click" Padding="9,8" Margin="2,0,0,0" ToolTip="고급 설정">
+                                    <TextBlock Text="&#xE70D;" FontFamily="Segoe MDL2 Assets" FontSize="10" VerticalAlignment="Center" />
+                                </Button>
+                                <Popup x:Name="ScanOptions" PlacementTarget="{Binding ElementName=ScanOptionsButton}" Placement="Bottom"
+                                       StaysOpen="False" AllowsTransparency="True" VerticalOffset="4" Closed="ScanOptions_Closed">
+                                    <Border Background="{DynamicResource Card}" BorderBrush="{DynamicResource CardBorder}" BorderThickness="1"
+                                            CornerRadius="6" Padding="14,12" MaxWidth="420">
+                                        <StackPanel>
+                                            <TextBlock Text="전체 스캔할 드라이브" FontWeight="SemiBold" />
+                                            <TextBlock Foreground="{DynamicResource SubText}" FontSize="12" TextWrapping="Wrap" Margin="0,2,0,8"
+                                                       Text="NTFS 파일 목록(MFT)만 읽을 수 있어 NTFS 가 아닌 드라이브는 고를 수 없습니다. 그런 곳은 Everything 을 켜 두거나 실행 파일을 직접 고르세요." />
+                                            <StackPanel x:Name="DrivePanel" />
+                                            <TextBlock x:Name="ScanNote" Foreground="{DynamicResource Accent}" FontSize="12" TextWrapping="Wrap" Margin="0,4,0,0" Visibility="Collapsed" />
+                                        </StackPanel>
+                                    </Border>
+                                </Popup>
+                            </StackPanel>
                         </WrapPanel>
                     </StackPanel>
                 </Border>

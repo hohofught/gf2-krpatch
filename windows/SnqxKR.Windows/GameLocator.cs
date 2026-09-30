@@ -20,7 +20,7 @@ namespace SnqxKR
 
     /// <summary>
     /// 디스크를 뒤지지 않고 런처/게임이 남긴 흔적에서 경로를 계산한다.
-    ///  실행 중인 게임·런처 프로세스, 레지스트리, 바로가기, B服 기본 설치 경로, 전에 찾았던 경로(전체 스캔 결과 포함)
+    ///  실행 중인 게임·런처 프로세스, 레지스트리, 바로가기, B服 기본 설치 경로, Everything 색인(떠 있으면), 전에 찾았던 경로(전체 스캔 결과 포함)
     /// 런처 폴더에서 게임 폴더를 얻는 규칙은 채널마다 다르다.
     ///  官服: PCLauncher.exe 옆 config.ini 의 game_install_path (없으면 "GF2 Game")
     ///  B服:  빌리빌리 런처(이름이 게임과 같은 GF2_Exilium.exe) 아래 "Games"
@@ -35,7 +35,8 @@ namespace SnqxKR
         private const string BiliGameFolder = "Games";
 
         /// <param name="knownDirs">전에 찾았던 게임·런처 폴더(전체 스캔 결과 포함). 매번 다시 검증하고 없어졌으면 버린다.</param>
-        public static List<GameInstall> LocateAll(IEnumerable<string> knownDirs)
+        /// <param name="note">기록에 남길 한 줄 (Everything 색인을 썼는지)</param>
+        public static List<GameInstall> LocateAll(IEnumerable<string> knownDirs, Action<string>? note = null)
         {
             var found = new Dictionary<string, GameInstall>(StringComparer.OrdinalIgnoreCase);
             var tried = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
@@ -55,6 +56,10 @@ namespace SnqxKR
             foreach (var (dir, source) in RegistryDirs()) Try(dir, source);
             foreach (var (dir, source) in ShortcutDirs()) Try(dir, source);
             foreach (var dir in BiliDefaultDirs()) Try(dir, "B服 기본 설치 경로");
+            // Everything 이 떠 있으면 그 색인에서 모든 드라이브를 본다 (관리자 권한·디스크 훑기 없이 수십 ms)
+            var indexed = EverythingSearch.Find(new[] { GameExe, OfficialLauncherExe }, 3000, out var everything);
+            note?.Invoke(everything);
+            foreach (var path in indexed) Try(Path.GetDirectoryName(path), "Everything 색인");
             foreach (var dir in knownDirs) Try(dir, "전에 찾은 경로");
 
             return found.Values.ToList();
