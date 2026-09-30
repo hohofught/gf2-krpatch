@@ -98,6 +98,8 @@ adb install -r snqx-krpatch-*.apk
 
 ## 윈도우
 
+![윈도우판 2.0: 중섭 官服 설치를 찾아 최신 한패가 적용된 상태. 에픽 글로벌판은 "중섭 아님"으로 고를 수 없다](docs/images/windows-v2.0.png)
+
 자세한 동작·판별 규칙은 [windows/README.md](windows/README.md).
 
 - **설치 없음**: exe 하나. .NET Framework 4.8 (Windows 10 1903+·11 에 기본 포함). `SnqxKR-native.exe` 는 C++ 엔진 DLL 을 안에 넣었고, 64비트가 아니거나 DLL 을 못 올리면(Smart App Control 등) C# 엔진으로 돈다.
