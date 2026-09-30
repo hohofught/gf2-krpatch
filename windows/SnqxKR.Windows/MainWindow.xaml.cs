@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
@@ -291,11 +292,14 @@ namespace SnqxKR
                 !tableExists ? ("Neutral", "게임 데이터가 아직 없습니다", "게임을 한 번 실행해서 로그인하고 데이터를 받은 뒤 '다시 찾기'를 누르세요")
                 : info.Running ? ("Warn", "게임이 실행 중입니다", "게임을 완전히 종료한 뒤 적용하세요")
                 : info.Status == PatchStatus.Official && mismatch ? ("Error", "게임 업데이트로 한글패치가 풀렸습니다",
-                    canRepair ? "새 한패가 나오기 전까지 임시 복구로 쓸 수 있습니다. 새로 생긴 문장만 중국어로 남습니다"
-                              : "받아 둔 한패는 이전 게임 버전용입니다. 새 한패가 올라오면 적용하세요")
+                    remotePending && canRepair ? "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 바로 넣고, 아직 아니면 임시 복구합니다"
+                    : remotePending ? "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 바로 넣습니다"
+                    : canRepair ? "새 한패가 나오기 전까지 임시 복구로 쓸 수 있습니다. 새로 생긴 문장만 중국어로 남습니다"
+                    : "받아 둔 한패는 이전 게임 버전용입니다. 새 한패가 올라오면 적용하세요")
                 : info.Status == PatchStatus.Repaired && match == true ? ("Info", "정식 한글패치가 나왔습니다", "임시 복구본을 정식 한패로 바꾸세요")
                 : info.Status == PatchStatus.Repaired ? ("Info", "임시 복구 적용됨",
-                    (t.RepairedCoverage >= 0 ? $"한국어 {t.RepairedCoverage:P1} · " : "") + "정식 한패를 기다리는 중")
+                    (t.RepairedCoverage >= 0 ? $"한국어 {t.RepairedCoverage:P1} · " : "") +
+                    (remotePending ? "서버에 새 한패가 올라왔습니다. 받아서 정식 한패면 바로 바꿉니다" : "정식 한패를 기다리는 중"))
                 : info.Status == PatchStatus.Foreign && mismatch ? ("Error", "게임 버전과 맞지 않는 한글패치",
                     "게임 업데이트 전 한패가 들어 있어 문장이 엉뚱하게 나올 수 있습니다. 게임 버전에 맞는 한패가 나오면 적용하세요")
                 : info.Status == PatchStatus.PatchedLatest ? ("Ok", "최신 한글패치 적용됨",
@@ -310,16 +314,13 @@ namespace SnqxKR
             HeroTitle.Text = title;
             HeroBody.Text = body;
 
-            // 주 버튼: 버전이 안 맞으면 옛 한패 적용 대신 임시 복구
-            string? primary =
-                !tableExists ? null
-                : info.Status == PatchStatus.Repaired && !mismatch ? "정식 한패로 교체"
-                : mismatch && info.Status != PatchStatus.Repaired && canRepair ? "임시 복구"
-                : mismatch ? null
-                : "한글패치 적용";
-            PrimaryButton.Content = primary ?? "";
+            // 큰 버튼: 지금 할 가장 좋은 일 하나 (PrimaryActions, 안드로이드와 같은 규칙)
+            var primary = PrimaryActions.Decide(tableExists, info.Status == PatchStatus.Repaired, match, canRepair, remotePending);
+            PrimaryButton.Content = primary == null ? "" : PrimaryActions.Label(primary.Value);
             PrimaryButton.Visibility = primary == null ? Visibility.Collapsed : Visibility.Visible;
-            PrimaryButton.Tag = primary == "임시 복구" ? "repair" : "apply";
+            PrimaryButton.Tag = primary;
+            // 큰 버튼이 "새 한패 확인" 이면 같은 일을 하는 '업데이트 확인' 은 숨긴다
+            CheckButton.Visibility = primary == PrimaryAction.Check ? Visibility.Collapsed : Visibility.Visible;
             PrimaryButton.IsEnabled = CheckButton.IsEnabled = !busy;
             RestoreButton.IsEnabled = !busy && File.Exists(t.BackupFile) && info.Status != PatchStatus.Official;
             RefreshButton.IsEnabled = PickButton.IsEnabled = ScanButton.IsEnabled = ScanOptionsButton.IsEnabled = !busy;
@@ -331,12 +332,16 @@ namespace SnqxKR
                           "한패 관리자가 고칠 때까지 넣지 않고 임시 복구를 씁니다.");
             else if (mismatch && !canRepair && info.Status != PatchStatus.Repaired)
                 notes.Add("받아 둔 한패는 이전 게임 버전용이라 넣지 않습니다. 이번 버전 공식 원본과 번역 메모리가 있어야 임시 복구할 수 있습니다.");
-            if (remotePending) notes.Add("새 한패가 올라왔습니다. '업데이트 확인'이나 적용을 누르면 받습니다.");
+            if (remotePending) notes.Add("새 한패가 올라왔습니다 (아직 받지 않음). 큰 버튼이나 '업데이트 확인'을 누르면 받습니다.");
             if (g.GameDir.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), StringComparison.OrdinalIgnoreCase) ||
                 g.GameDir.StartsWith(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), StringComparison.OrdinalIgnoreCase))
                 notes.Add("Program Files 안에 설치돼 있어 파일을 넣을 때 관리자 권한 창이 뜹니다.");
             NoteText.Text = string.Join("\n", notes);
             NoteText.Visibility = notes.Count > 0 ? Visibility.Visible : Visibility.Collapsed;
+            // 자리 검사에 걸린 한패: 안드로이드처럼 늘 "그래도 이 한패 적용" 을 둔다. 넣게 될 한패(받은 시각, 자리 일치율)를 적는다
+            ForceButton.Visibility = tableExists && info.PatchAligned == false ? Visibility.Visible : Visibility.Collapsed;
+            ForceButton.Content = "그래도 이 한패 적용 (" + PatchInfo(info) + ")";
+            ForceButton.IsEnabled = !busy;
 
             // 상세
             InfoPanel.Children.Clear();
@@ -378,8 +383,51 @@ namespace SnqxKR
         {
             var g = Selected;
             if (g == null) return;
-            if ((string)PrimaryButton.Tag == "repair") await Run("임시 복구 중", () => RepairAsync(g));
-            else await Run("한글패치 적용 중", () => ApplyAsync(g));
+            switch (PrimaryButton.Tag as PrimaryAction?)
+            {
+                case PrimaryAction.Repair:
+                    await Run("임시 복구 중", () => RepairAsync(g));
+                    break;
+                case PrimaryAction.UpdateApply:
+                case PrimaryAction.UpdateReplace:
+                    await Run("새 한패 받는 중", () => UpdateThenAsync(g));
+                    break;
+                case PrimaryAction.Check:
+                    await Run("새 한패 확인 중", async () =>
+                    {
+                        await SyncAsync();
+                        await ReinspectAsync(g);
+                    });
+                    break;
+                default:
+                    await Run("한글패치 적용 중", () => ApplyAsync(g));
+                    break;
+            }
+        }
+
+        /// <summary>
+        /// 새 한패를 받아, 이 게임 버전용이면 넣고(임시 복구 중이면 교체) 아직 옛 버전용이면 임시 복구한다.
+        /// 문장 자리가 맞지 않는 한패는 넣지 않는다 (적용과 같은 규칙).
+        /// </summary>
+        private async Task UpdateThenAsync(GameInstall g)
+        {
+            await SyncAsync();
+            await ReinspectAsync(g);
+            if (!inspections.TryGetValue(g.GameDir, out var info)) return;
+            if (Match(info) == true)
+            {
+                await ApplyAsync(g);
+                return;
+            }
+            if (info.Status != PatchStatus.Repaired && service.CanRepair(g, info))
+            {
+                Log(info.PatchAligned == false ? "새 한패의 문장 자리가 원문과 맞지 않아 임시 복구합니다" : "새 한패도 아직 이전 게임 버전용이라 임시 복구합니다");
+                await RepairAsync(g);
+                return;
+            }
+            Show(info.PatchAligned == false ? "새 한패의 문장 자리가 원문과 맞지 않아 넣지 않았습니다"
+                 : info.Status == PatchStatus.Repaired ? "새 한패도 아직 이전 게임 버전용입니다. 임시 복구를 그대로 씁니다"
+                 : "새 한패도 아직 이전 게임 버전용입니다. 새 한패를 기다리세요");
         }
 
         private async void Check_Click(object sender, RoutedEventArgs e)
@@ -425,12 +473,40 @@ namespace SnqxKR
             ProgressText.Text = "게임 폴더에 넣는 중";
             var r = await service.ApplyAsync(g);
             // 자리 검사에 걸린 한패: 번역 수정판 등 사용자가 괜찮다고 보면 그래도 넣을 수 있다
-            if (r.Outcome == Outcome.Misaligned &&
-                MessageBox.Show(this, $"새 한패의 문장 자리가 원문과 맞지 않습니다 (번역 안 된 줄 중 {r.Coverage:P0} 일치).\n" +
-                                      "그대로 넣으면 문장이 엉뚱한 곳에 나올 수 있습니다. 그래도 넣을까요?\n\n" +
-                                      "(아니요: 넣지 않고 임시 복구를 계속 씁니다)",
-                    Title, MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes)
+            if (r.Outcome == Outcome.Misaligned && ConfirmForce(r.Coverage))
                 r = await service.ApplyAsync(g, force: true);
+            ShowApplyResult(r);
+            await ReinspectAsync(g);
+        }
+
+        /// <summary>
+        /// "그래도 이 한패 적용": 자리 검사에 걸린, 지금 받아 둔 그 한패를 넣는다.
+        /// 버튼에 보인 한패와 넣는 한패가 같도록 새로 받지 않는다 (안드로이드 forceApply 와 같다).
+        /// </summary>
+        private async void Force_Click(object sender, RoutedEventArgs e)
+        {
+            var g = Selected;
+            if (g == null || !inspections.TryGetValue(g.GameDir, out var info) || !ConfirmForce(info.AlignRatio)) return;
+            await Run("한글패치 적용 중", async () =>
+            {
+                ShowApplyResult(await service.ApplyAsync(g, force: true));
+                await ReinspectAsync(g);
+            });
+        }
+
+        /// <summary>받아 둔 한패: 받은 시각 · 원문과 자리 일치율 (안드로이드 버튼과 같은 모양)</summary>
+        private string PatchInfo(Inspection info) =>
+            (File.Exists(store.CacheFile) ? File.GetLastWriteTime(store.CacheFile).ToString("MM/dd HH:mm") + " 받음 · " : "") +
+            "원문과 자리 일치 " + (Math.Max(0, info.AlignRatio) * 100).ToString("0.0", CultureInfo.InvariantCulture) + "%";
+
+        private bool ConfirmForce(double ratio) =>
+            MessageBox.Show(this, $"새 한패의 문장 자리가 원문과 맞지 않습니다 (번역 안 된 줄 중 {Math.Max(0, ratio):P0} 일치).\n" +
+                                  "그대로 넣으면 문장이 엉뚱한 곳에 나올 수 있습니다. 그래도 넣을까요?\n\n" +
+                                  "(아니요: 넣지 않고 임시 복구를 계속 씁니다)",
+                Title, MessageBoxButton.YesNo, MessageBoxImage.Warning) == MessageBoxResult.Yes;
+
+        private void ShowApplyResult(ActionResult r)
+        {
             Show(r.Outcome switch
             {
                 Outcome.Done => "한글패치 적용 완료",
@@ -441,7 +517,6 @@ namespace SnqxKR
                 Outcome.Misaligned => $"새 한패의 문장 자리가 원문과 맞지 않아 넣지 않았습니다 ({r.Coverage:P0} 일치). 임시 복구를 쓰세요",
                 _ => "적용 실패: " + r.Message,
             });
-            await ReinspectAsync(g);
         }
 
         private async Task RepairAsync(GameInstall g)

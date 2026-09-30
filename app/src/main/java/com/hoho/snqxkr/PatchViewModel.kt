@@ -29,6 +29,8 @@ data class UiState(
     val targetTime: Long = 0,
     val cacheSize: Long = -1,
     val cacheSha: String = "",
+    /** 받아 둔 한패 파일을 받은 시각 (캐시 파일의 저장 시각, 없으면 0) */
+    val patchReceivedAt: Long = 0,
     val checkedAt: Long = 0,
     val appliedAt: Long = 0,
     val hasBackup: Boolean = false,
@@ -132,6 +134,18 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         }
         if (shizuku == ShizukuState.READY) inspectTarget()
         maybePrepareMemory()
+        checkRemoteQuietly()
+    }
+
+    /**
+     * 서버에 아직 받지 않은 새 한패가 있는지만 본다 (HEAD, 본문 0바이트. 윈도우도 앱을 열 때 같은 확인을 한다).
+     * 큰 버튼이 "새 한패 받아서 적용" 을 고를 수 있게 한다. 네트워크가 없으면 전에 본 값을 그대로 쓴다.
+     */
+    private fun checkRemoteQuietly() = viewModelScope.launch {
+        val remote = withContext(Dispatchers.IO) { repo.remoteEtag() } ?: return@launch
+        val pending = repo.cachedSha.isEmpty() || remote != repo.etag
+        repo.remotePending = pending
+        _ui.update { it.copy(remotePending = pending) }
     }
 
     private var autoMemoryTried = false
@@ -156,6 +170,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         return copy(
             cacheSize = if (repo.cacheFile.isFile) repo.cacheFile.length() else -1,
             cacheSha = repo.cachedSha,
+            patchReceivedAt = if (repo.cacheFile.isFile) repo.cacheFile.lastModified() else 0L,
             checkedAt = repo.checkedAt,
             appliedAt = t?.appliedAt ?: 0L,
             hasBackup = t?.backupFile?.isFile == true,
@@ -275,16 +290,25 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
      * 다운로드(필요 시) 후 게임 폴더에 적용. 게임 버전과 안 맞는 한패는 넣지 않는다.
      * force: 자리 검사에 걸린 한패를 사용자가 그래도 넣겠다고 한 경우
      */
-    fun downloadAndApply(force: Boolean = false) = launchTask(busyLabel = "패치 적용 중") {
-        val pkg = _ui.value.gamePkg ?: run { log("게임이 설치돼 있지 않습니다"); return@launchTask }
-        val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return@launchTask }
+    fun downloadAndApply(force: Boolean = false) = launchTask(busyLabel = "패치 적용 중") { applyNow(force) }
 
-        when (val r = doSync()) {
+    /**
+     * "그래도 이 한패 적용": 자리 검사에 걸린, 지금 받아 둔 그 한패를 넣는다.
+     * 버튼에 보인 한패와 넣는 한패가 같도록 새로 받지 않는다 (윈도우 Force_Click 과 같다).
+     */
+    fun forceApply() = launchTask(busyLabel = "패치 적용 중") { applyNow(force = true, sync = false) }
+
+    /** sync=false 면 서버에서 새로 받지 않고 받아 둔 한패를 그대로 쓴다 */
+    private suspend fun applyNow(force: Boolean, sync: Boolean = true) {
+        val pkg = _ui.value.gamePkg ?: run { log("게임이 설치돼 있지 않습니다"); return }
+        val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return }
+
+        if (sync) when (val r = doSync()) {
             is SyncResult.Failed -> {
                 log("다운로드 실패: " + r.message)
                 if (!repo.cacheFile.isFile) {
                     _ui.update { it.copy(snack = "다운로드 실패: " + r.message) }
-                    return@launchTask
+                    return
                 }
                 log("캐시된 한패로 계속 진행")
             }
@@ -320,9 +344,11 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
      * 게임 업데이트로 한패가 안 맞을 때, 새 공식 원본을 번역 메모리로 한국어화하고
      * 업데이트 전에 쓰던 한패의 번역도 새 자리로 옮겨서 넣는다
      */
-    fun repair() = launchTask(busyLabel = "임시 복구 중") {
-        val pkg = _ui.value.gamePkg ?: return@launchTask
-        val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return@launchTask }
+    fun repair() = launchTask(busyLabel = "임시 복구 중") { repairNow() }
+
+    private suspend fun repairNow() {
+        val pkg = _ui.value.gamePkg ?: return
+        val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return }
         if (!repo.cacheFile.isFile) log("받아 둔 한패가 없어 번역 메모리만으로 복구합니다")
         _ui.update { it.copy(busyLabel = "새 공식 원본을 한국어로 바꾸는 중", progress = -1f) }
         val snack = when (val r = engine.repair(svc, pkg, ::log)) {
@@ -341,6 +367,36 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         }
         _ui.update { it.copy(snack = snack) }
         inspectTargetInternal()
+    }
+
+    /**
+     * 큰 버튼 "새 한패 받아서 적용·교체": 새 한패를 받아, 이 게임 버전용이면 넣고(임시 복구 중이면 교체)
+     * 아직 옛 버전용이면 임시 복구한다. 문장 자리가 맞지 않는 한패는 넣지 않는다 (윈도우 UpdateThenAsync 와 같은 규칙).
+     */
+    fun updateThen() = launchTask(busyLabel = "새 한패 받는 중") {
+        when (val r = doSync()) {
+            is SyncResult.UpToDate -> log("최신 상태 (" + r.via + ") · " + human(r.size))
+            is SyncResult.Downloaded -> log("새 한패 다운로드 완료 · " + human(r.size))
+            is SyncResult.Failed -> log("확인 실패: " + r.message)
+        }
+        inspectTargetInternal()
+        val u = _ui.value
+        when {
+            u.patchMatchesGame == true && !u.patchMisaligned -> applyNow(force = false)
+            u.status != PatchStatus.REPAIRED && u.canRepair -> {
+                log(if (u.patchMisaligned) "새 한패의 문장 자리가 원문과 맞지 않아 임시 복구합니다" else "새 한패도 아직 이전 게임 버전용이라 임시 복구합니다")
+                repairNow()
+            }
+            else -> _ui.update {
+                it.copy(
+                    snack = when {
+                        u.patchMisaligned -> "새 한패의 문장 자리가 원문과 맞지 않아 넣지 않았습니다"
+                        u.status == PatchStatus.REPAIRED -> "새 한패도 아직 이전 게임 버전용입니다. 임시 복구를 그대로 씁니다"
+                        else -> "새 한패도 아직 이전 게임 버전용입니다. 새 한패를 기다리세요"
+                    }
+                )
+            }
+        }
     }
 
     /** 번역 메모리 준비: 1.0 이 남긴 원본 백업 + GitHub 이력의 같은 버전 한패 */

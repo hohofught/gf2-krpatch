@@ -98,6 +98,8 @@
                         </WrapPanel>
                         <TextBlock x:Name="ResultText" Foreground="{DynamicResource Accent}" TextWrapping="Wrap" Visibility="Collapsed" Margin="0,0,0,6" />
                         <TextBlock x:Name="NoteText" Foreground="{DynamicResource SubText}" TextWrapping="Wrap" Visibility="Collapsed" Margin="0,0,0,6" />
+                        <!-- 자리 검사에 걸린 한패를 그래도 넣기 (넣게 될 한패 정보를 버튼에 적는다) -->
+                        <Button x:Name="ForceButton" Click="Force_Click" Visibility="Collapsed" HorizontalAlignment="Left" Margin="0,0,0,8" />
                         <StackPanel x:Name="InfoPanel" Margin="0,6,0,0" />
                     </StackPanel>
                 </Border>

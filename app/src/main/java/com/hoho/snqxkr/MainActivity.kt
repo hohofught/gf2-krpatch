@@ -236,7 +236,9 @@ private fun StatusHero(ui: UiState) {
         // 게임 업데이트로 한패가 풀렸고, 받아 둔 한패는 아직 옛 버전용
         ui.status == PatchStatus.OFFICIAL && ui.patchMatchesGame == false -> HeroLook(
             Icons.Rounded.Warning, "게임 업데이트로 한글패치가 풀렸습니다",
-            if (ui.canRepair) "새 한패가 나오기 전까지 임시 복구로 쓸 수 있습니다. 새로 생긴 문장만 중국어로 남습니다"
+            if (ui.remotePending && ui.canRepair) "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 바로 넣고, 아직 아니면 임시 복구합니다"
+            else if (ui.remotePending) "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 바로 넣습니다"
+            else if (ui.canRepair) "새 한패가 나오기 전까지 임시 복구로 쓸 수 있습니다. 새로 생긴 문장만 중국어로 남습니다"
             else "새 한패를 기다리는 중입니다. 번역 메모리가 있으면 임시 복구할 수 있습니다",
             cs.errorContainer, cs.onErrorContainer
         )
@@ -247,7 +249,8 @@ private fun StatusHero(ui: UiState) {
         ui.status == PatchStatus.REPAIRED -> HeroLook(
             Icons.Rounded.AutoFixHigh, "임시 복구 적용됨",
             (if (ui.repairedCoverage >= 0) "한국어 " + PatchViewModel.percent(ui.repairedCoverage.toDouble()) + " · " else "") +
-                "정식 한패를 기다리는 중 · 확인 " + PatchViewModel.time(ui.checkedAt),
+                if (ui.remotePending) "서버에 새 한패가 올라왔습니다. 받아서 정식 한패면 바로 바꿉니다"
+                else "정식 한패를 기다리는 중 · 확인 " + PatchViewModel.time(ui.checkedAt),
             cs.secondaryContainer, cs.onSecondaryContainer
         )
         ui.status == PatchStatus.FOREIGN && ui.patchMatchesGame == false -> HeroLook(
@@ -334,13 +337,19 @@ private fun StatusHero(ui: UiState) {
 
 @Composable
 private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
-    // 받아 둔 한패가 게임 버전과 안 맞으면 옛 한패 적용 대신 임시 복구를 앞에 둔다
+    // 큰 버튼: 지금 할 가장 좋은 일 하나 (PrimaryAction, 윈도우와 같은 규칙)
     val mismatch = ui.patchMatchesGame == false
-    val primary: Triple<String, ImageVector, () -> Unit>? = when {
-        ui.status == PatchStatus.REPAIRED && !mismatch -> Triple("정식 한패로 교체", Icons.Rounded.Download) { vm.downloadAndApply() }
-        mismatch && ui.status != PatchStatus.REPAIRED && ui.canRepair -> Triple("임시 복구", Icons.Rounded.AutoFixHigh) { vm.repair() }
-        mismatch -> null
-        else -> Triple("한글패치 적용", Icons.Rounded.Download) { vm.downloadAndApply() }
+    val action = PrimaryAction.decide(
+        gameReady = true, repaired = ui.status == PatchStatus.REPAIRED, matches = ui.patchMatchesGame,
+        canRepair = ui.canRepair, remotePending = ui.remotePending,
+    )
+    val primary: Triple<String, ImageVector, () -> Unit>? = action?.let { a ->
+        when (a) {
+            PrimaryAction.REPAIR -> Triple(a.label, Icons.Rounded.AutoFixHigh) { vm.repair() }
+            PrimaryAction.UPDATE_APPLY, PrimaryAction.UPDATE_REPLACE -> Triple(a.label, Icons.Rounded.Download) { vm.updateThen() }
+            PrimaryAction.CHECK -> Triple(a.label, Icons.Rounded.Refresh) { vm.checkUpdate() }
+            PrimaryAction.APPLY, PrimaryAction.REPLACE -> Triple(a.label, Icons.Rounded.Download) { vm.downloadAndApply() }
+        }
     }
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (primary != null) {
@@ -361,18 +370,24 @@ private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
                     "(번역 안 된 줄 중 ${PatchViewModel.percent(ui.alignRatio.coerceAtLeast(0.0))} 일치). " +
                     "한패 관리자가 고칠 때까지 넣지 않고 임시 복구를 씁니다."
             )
+            // 넣게 될 한패가 무엇인지 버튼에 적는다: 받은 시각, 원문과 자리 일치율
+            val patchInfo = listOfNotNull(
+                if (ui.patchReceivedAt > 0) PatchViewModel.time(ui.patchReceivedAt) + " 받음" else null,
+                "원문과 자리 일치 " + PatchViewModel.percent(ui.alignRatio.coerceAtLeast(0.0)),
+            ).joinToString(" · ")
             TextButton(
-                onClick = { vm.downloadAndApply(force = true) },
+                onClick = { vm.forceApply() },
                 enabled = !ui.busy && ui.shizuku == ShizukuState.READY,
-            ) { Text("그래도 이 한패 적용") }
+            ) { Text("그래도 이 한패 적용 ($patchInfo)") }
         } else if (mismatch && !ui.canRepair && ui.status != PatchStatus.REPAIRED) {
             Notice(
                 "받아 둔 한패는 이전 게임 버전용이라 넣지 않습니다. " +
                     if (ui.canBootstrap) "아래 '번역 메모리 준비'를 하면 임시 복구할 수 있습니다." else "새 한패가 나오면 알려드립니다."
             )
         }
-        if (ui.remotePending) Notice("새 한패가 올라왔습니다. 모바일 데이터라 아직 받지 않았습니다 (설정에서 바꿀 수 있습니다)")
-        OutlinedButton(
+        if (ui.remotePending) Notice("새 한패가 올라왔습니다 (아직 받지 않음). 큰 버튼이나 '업데이트만 확인'을 누르면 받습니다.")
+        // 큰 버튼이 "새 한패 확인" 이면 같은 일을 하는 버튼은 숨긴다
+        if (action != PrimaryAction.CHECK) OutlinedButton(
             onClick = { vm.checkUpdate() },
             enabled = !ui.busy,
             modifier = Modifier.fillMaxWidth().height(48.dp),
