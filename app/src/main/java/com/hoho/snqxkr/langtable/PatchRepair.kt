@@ -87,10 +87,11 @@ object PatchRepair {
         val oc = oldPatch.texts.cursor()
         val oh = LongArray(O) { key(oc, oOrd[it]) }
 
-        // 새 쪽 문장 색인: 해시 상위 비트에 위치를 붙여 정렬 (HashMap 없이)
+        // 새 쪽 문장 색인: 해시 상위 비트에 위치를 붙여 정렬 (HashMap 없이). 위치가 붙어 값이 모두 달라 칸 색인이 늘 만들어진다
         val posBits = 64 - java.lang.Long.numberOfLeadingZeros(nh.size.toLong().coerceAtLeast(1))
         val low = (1L shl posBits) - 1
         val packed = LongArray(nh.size) { (nh[it] and low.inv()) or it.toLong() }.also { it.sort() }
+        val pb = TranslationMemory.bucketIndex(packed)
 
         fun nextOk(a: Int, b: Int) = a + 1 < O && b + 1 < N && oNext[a] && nNext[b] && oh[a + 1] != 0L && oh[a + 1] == nh[b + 1]
         fun prevOk(a: Int, b: Int) = a > 0 && b > 0 && oNext[a - 1] && nNext[b - 1] && oh[a - 1] != 0L && oh[a - 1] == nh[b - 1]
@@ -101,7 +102,8 @@ object PatchRepair {
             val h = oh[a]
             if (h == 0L) continue
             val hi = h and low.inv()
-            var k = lowerBound(packed, hi)
+            val d = TranslationMemory.bucketOf(hi)
+            var k = if (pb != null) TranslationMemory.lowerBound(packed, pb[d], pb[d + 1], hi) else TranslationMemory.lowerBound(packed, 0, packed.size, hi)
             val first = k
             while (k < packed.size && (packed[k] and low.inv()) == hi) k++
             if (k - first > MAX_CANDIDATES) continue
@@ -206,21 +208,53 @@ object PatchRepair {
 
     private fun nonZero(h: Long) = if (h == 0L) 1L else h
 
-    private fun lowerBound(a: LongArray, v: Long): Int {
-        var lo = 0
-        var hi = a.size
-        while (lo < hi) {
-            val mid = (lo + hi) ushr 1
-            if (a[mid] < v) lo = mid + 1 else hi = mid
+    /**
+     * 번역해도 그대로 남아야 하는 것: 태그, 자리표시자, 줄바꿈, 숫자 (순서 무관). utf8 의 앞 n 바이트.
+     * 정규식 \{[0-9]+\}|%[0-9.]*[sdf]|<[^<>]{1,40}>|\\n|\n|[0-9]+(?:\.[0-9]+)? 과 같은 규칙을 UTF-16 코드 단위로 직접 훑는다
+     * (C#·C++ 와 같은 코드). 자바 정규식은 이모지 같은 글자를 한 글자로 세어 태그 길이 40 을 .NET·C++ 와 다르게 판단한다.
+     */
+    internal fun shape(utf8: ByteArray, n: Int = utf8.size): String {
+        val s = decodeUtf8(utf8, n)
+        val len = s.length
+        fun digit(c: Char) = c in '0'..'9'
+        val tokens = ArrayList<String>()
+        var i = 0
+        while (i < len) {
+            val c = s[i]
+            var end = 0 // 0 = 여기서 맞는 것 없음
+            if (c == '{') {
+                var j = i + 1
+                while (j < len && digit(s[j])) j++
+                if (j > i + 1 && j < len && s[j] == '}') end = j + 1
+            } else if (c == '%') {
+                var j = i + 1
+                while (j < len && (digit(s[j]) || s[j] == '.')) j++
+                if (j < len && (s[j] == 's' || s[j] == 'd' || s[j] == 'f')) end = j + 1
+            } else if (c == '<') {
+                var j = i + 1
+                while (j < len && s[j] != '<' && s[j] != '>') j++
+                val run = j - (i + 1)
+                if (run in 1..40 && j < len && s[j] == '>') end = j + 1
+            } else if (c == '\\') {
+                if (i + 1 < len && s[i + 1] == 'n') end = i + 2
+            } else if (c == '\n') {
+                end = i + 1
+            } else if (digit(c)) {
+                var j = i + 1
+                while (j < len && digit(s[j])) j++
+                if (j + 1 < len && s[j] == '.' && digit(s[j + 1])) {
+                    j += 2
+                    while (j < len && digit(s[j])) j++
+                }
+                end = j
+            }
+            if (end == 0) { i++; continue }
+            tokens.add(s.substring(i, end))
+            i = end
         }
-        return lo
+        tokens.sort()
+        return tokens.joinToString("\u0001")
     }
-
-    private val SHAPE = Regex("""\{[0-9]+\}|%[0-9.]*[sdf]|<[^<>]{1,40}>|\\n|\n|[0-9]+(?:\.[0-9]+)?""")
-
-    /** 번역해도 그대로 남아야 하는 것: 태그, 자리표시자, 줄바꿈, 숫자 (순서 무관). utf8 의 앞 n 바이트 */
-    internal fun shape(utf8: ByteArray, n: Int = utf8.size): String =
-        SHAPE.findAll(decodeUtf8(utf8, n)).map { it.value }.sorted().joinToString("\u0001")
 
     /**
      * UTF-8 → UTF-16. 깨진 바이트는 한 바이트마다 U+FFFD.

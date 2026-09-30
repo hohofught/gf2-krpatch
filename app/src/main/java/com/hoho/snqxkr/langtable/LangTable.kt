@@ -459,6 +459,7 @@ internal class StreamReader(private val input: InputStream) {
             r = r or ((x and 0x7f).toLong() shl s)
             if (x < 0x80) return r
             s += 7
+            if (s > 63) throw java.io.IOException("varint 가 너무 김") // 10바이트까지 ([Reader]·C#·C++ 와 같다)
         }
     }
 

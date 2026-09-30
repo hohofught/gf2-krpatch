@@ -32,7 +32,17 @@ class TranslationMemory private constructor(
         }
 
     /** 원문 해시([hash])로 찾은 줄 번호. 없으면 음수 */
-    fun find(hash: Long): Int = keys.binarySearch(hash)
+    fun find(hash: Long): Int {
+        val b = buckets
+        val d = bucketOf(hash)
+        val from = if (b != null) b[d] else 0
+        val to = if (b != null) b[d + 1] else keys.size
+        val i = lowerBound(keys, from, to, hash)
+        return if (i < to && keys[i] == hash) i else -1
+    }
+
+    /** [find] 용 칸 색인 ([bucketIndex]). 처음 찾을 때 만든다 */
+    private val buckets: IntArray? by lazy { bucketIndex(keys) }
 
     /** 원문으로 찾은 번역 (복사본. 시험·작은 곳용) */
     operator fun get(source: ByteArray): ByteArray? {
@@ -103,6 +113,41 @@ class TranslationMemory private constructor(
         /** 번역 메모리 파일 최대 크기. 지금 속도(업데이트마다 1~2MB)로는 몇 년 걸린다. */
         const val MAX_BYTES = 500L * 1024 * 1024
 
+        /** 칸 색인은 해시 상위 16비트로 나눈다 (65,537칸, 256KB) */
+        private const val BUCKET_BITS = 16
+
+        /** v 가 들어갈 칸. 부호 비트를 뒤집어 부호 있는 순서를 그대로 따른다 */
+        internal fun bucketOf(v: Long): Int = ((v xor Long.MIN_VALUE) ushr (64 - BUCKET_BITS)).toInt()
+
+        /**
+         * 오름차순 배열의 칸 색인: 칸 d 의 값은 a[r[d], r[d+1]) 에 있다. 해시는 고르게 퍼져 한 칸에 몇 개뿐이라
+         * 이진 탐색이 전체(27만 줄이면 18단계) 대신 칸 안(2~3단계)에서 끝나고, 찾은 자리는 전체에서 찾은 것과 같다.
+         * 엄격히 오름차순이 아니면(깨진 메모리 파일) null: 전체에서 [lowerBound] 로 찾는다.
+         */
+        internal fun bucketIndex(a: LongArray): IntArray? {
+            val r = IntArray((1 shl BUCKET_BITS) + 1)
+            for (i in a.indices) {
+                if (i > 0 && a[i] <= a[i - 1]) return null
+                r[bucketOf(a[i]) + 1]++
+            }
+            for (d in 0 until (1 shl BUCKET_BITS)) r[d + 1] += r[d]
+            return r
+        }
+
+        /**
+         * a[from, to) 에서 v 이상인 첫 자리 (없으면 to). C#·C++ 와 같은 순서로 반씩 나눠, 정렬이 깨진 배열에서도
+         * 세 엔진이 같은 자리를 낸다 (라이브러리 이진 탐색은 엔진마다 나누는 방식이 다르다).
+         */
+        internal fun lowerBound(a: LongArray, from: Int, to: Int, v: Long): Int {
+            var lo = from
+            var hi = to
+            while (lo < hi) {
+                val mid = (lo + hi) ushr 1
+                if (a[mid] < v) lo = mid + 1 else hi = mid
+            }
+            return lo
+        }
+
         /**
          * 같은 게임 버전의 공식 원문과 한패를 같은 Id 끼리 짝지어 만든다.
          * 한패가 원문을 그대로 둔 문장(미번역, 숫자·기호)은 넣지 않는다. 번역은 한패 파일 안의 자리로 든다.
@@ -159,14 +204,21 @@ class TranslationMemory private constructor(
             }
         }
 
-        /** 파일을 매핑해 읽는다. 번역은 복사하지 않고 파일 안의 자리만 든다 (27만 줄에 힙 5MB 안팎). */
+        /**
+         * 파일을 매핑해 읽는다. 번역은 복사하지 않고 파일 안의 자리만 든다 (27만 줄에 힙 5MB 안팎).
+         * 첫 4바이트로 바이트 순서를 가린다: 윈도우 0.2 는 리틀엔디안으로 썼다 (C#·C++ 와 같게 읽는다).
+         */
         fun read(file: File): TranslationMemory {
             val b = Texts.map(file)
             val size = b.capacity()
             val r = BufReader(b, size)
-            val magic = r.u32be()
+            val be = r.u32be()
+            val big = be == MAGIC_V1 || be == MAGIC_V2
+            val magic = if (big) be else Integer.reverseBytes(be)
             require(magic == MAGIC_V1 || magic == MAGIC_V2) { "번역 메모리 파일이 아닙니다" }
-            val n = r.u32be()
+            fun u32(): Int = if (big) r.u32be() else Integer.reverseBytes(r.u32be())
+            fun u64(): Long = if (big) r.u64be() else java.lang.Long.reverseBytes(r.u64be())
+            val n = u32()
             // 줄마다 12바이트 이상이므로 파일 크기로 줄 수를 확인한다 (깨진 파일에 큰 배열을 잡지 않게)
             require(n >= 0 && n <= (size - HEADER_BYTES) / 12) { "번역 메모리 줄 수가 이상함" }
             val keys = LongArray(n)
@@ -175,9 +227,9 @@ class TranslationMemory private constructor(
             val len = IntArray(n)
             var left = size - HEADER_BYTES
             for (i in 0 until n) {
-                keys[i] = r.u64be()
-                if (magic == MAGIC_V2) gens[i] = r.u32be()
-                val l = r.u32be()
+                keys[i] = u64()
+                if (magic == MAGIC_V2) gens[i] = u32()
+                val l = u32()
                 left -= (if (magic == MAGIC_V2) ENTRY_BYTES else 12L) + l
                 require(l >= 0 && left >= 0) { "번역 메모리 파일이 끊김" }
                 off[i] = r.p; len[i] = l

@@ -349,6 +349,8 @@ namespace SnqxKR.Engine
             {
                 long tag = Varint(header, ref p);
                 if ((tag & 7) == 0) { Varint(header, ref p); continue; }
+                // 그 밖의 wire type 은 깨진 색인 (안드로이드 chunkKeyOf 와 같은 규칙)
+                if ((tag & 7) != 2) throw new InvalidDataException("색인 wire type " + (tag & 7));
                 int len = Len(header, ref p, header.Length);
                 int end = p + len;
                 if (tag >> 3 == 3)

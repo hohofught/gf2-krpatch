@@ -1,7 +1,7 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Text.RegularExpressions;
 
 namespace SnqxKR.Engine
 {
@@ -142,13 +142,14 @@ namespace SnqxKR.Engine
             for (int a = 0; a + 1 < O; a++) oNext[a] = oldPatch.Ids[oOrd[a + 1]] == oldPatch.Ids[oOrd[a]] + 1;
             var oh = oOrd.Select(i => Key(ot, i)).ToArray();
 
-            // 새 쪽 문장 색인: 해시 상위 비트에 위치를 붙여 정렬 (Dictionary 없이)
+            // 새 쪽 문장 색인: 해시 상위 비트에 위치를 붙여 정렬 (Dictionary 없이). 위치가 붙어 값이 모두 달라 칸 색인이 늘 만들어진다
             int posBits = 1;
             while ((1L << posBits) <= nh.Length) posBits++;
             long low = (1L << posBits) - 1;
             var packed = new long[nh.Length];
             for (int i = 0; i < nh.Length; i++) packed[i] = (nh[i] & ~low) | (long)i;
             Array.Sort(packed);
+            var pb = TranslationMemory.BucketIndex(packed);
 
             bool NextOk(int a, int b) => a + 1 < O && b + 1 < N && oNext[a] && nNext[b] && oh[a + 1] != 0 && oh[a + 1] == nh[b + 1];
             bool PrevOk(int a, int b) => a > 0 && b > 0 && oNext[a - 1] && nNext[b - 1] && oh[a - 1] != 0 && oh[a - 1] == nh[b - 1];
@@ -160,7 +161,9 @@ namespace SnqxKR.Engine
                 long h = oh[a];
                 if (h == 0) continue;
                 long hi = h & ~low;
-                int first = LowerBound(packed, hi), k = first;
+                int d = TranslationMemory.BucketOf(hi);
+                int first = pb != null ? TranslationMemory.LowerBound(packed, pb[d], pb[d + 1], hi) : TranslationMemory.LowerBound(packed, 0, packed.Length, hi);
+                int k = first;
                 while (k < packed.Length && (packed[k] & ~low) == hi) k++;
                 if (k - first > MaxCandidates) continue;
                 int best = 0, second = 0, bestB = -1;
@@ -223,26 +226,65 @@ namespace SnqxKR.Engine
 
         private static long NonZero(long h) => h == 0 ? 1 : h;
 
-        private static int LowerBound(long[] a, long v)
-        {
-            int lo = 0, hi = a.Length;
-            while (lo < hi)
-            {
-                int mid = lo + (hi - lo) / 2;
-                if (a[mid] < v) lo = mid + 1; else hi = mid;
-            }
-            return lo;
-        }
-
-        private static readonly Regex ShapeToken = new Regex(@"\{[0-9]+\}|%[0-9.]*[sdf]|<[^<>]{1,40}>|\\n|\n|[0-9]+(?:\.[0-9]+)?", RegexOptions.CultureInvariant);
-
         /// <summary>번역해도 그대로 남아야 하는 것: 태그, 자리표시자, 줄바꿈, 숫자 (순서 무관)</summary>
         internal static string Shape(byte[] utf8) => Shape(utf8, 0, utf8.Length);
 
-        /// <summary>b 의 off 부터 len 바이트</summary>
+        /// <summary>
+        /// b 의 off 부터 len 바이트. 정규식 \{[0-9]+\}|%[0-9.]*[sdf]|&lt;[^&lt;&gt;]{1,40}&gt;|\\n|\n|[0-9]+(?:\.[0-9]+)? 과 같은 규칙을
+        /// UTF-16 코드 단위로 직접 훑는다 (Kotlin·C++ 와 같은 코드. 자바 정규식은 이모지를 한 글자로 세어 태그 길이 판단이 달랐다).
+        /// </summary>
         internal static string Shape(byte[] b, int off, int len)
         {
-            var tokens = ShapeToken.Matches(DecodeUtf8(b, off, len)).Cast<Match>().Select(m => m.Value).ToList();
+            string s = DecodeUtf8(b, off, len);
+            int n = s.Length;
+            bool Digit(char c) => c >= '0' && c <= '9';
+            var tokens = new List<string>();
+            for (int i = 0; i < n;)
+            {
+                char c = s[i];
+                int end = 0; // 0 = 여기서 맞는 것 없음
+                if (c == '{')
+                {
+                    int j = i + 1;
+                    while (j < n && Digit(s[j])) j++;
+                    if (j > i + 1 && j < n && s[j] == '}') end = j + 1;
+                }
+                else if (c == '%')
+                {
+                    int j = i + 1;
+                    while (j < n && (Digit(s[j]) || s[j] == '.')) j++;
+                    if (j < n && (s[j] == 's' || s[j] == 'd' || s[j] == 'f')) end = j + 1;
+                }
+                else if (c == '<')
+                {
+                    int j = i + 1;
+                    while (j < n && s[j] != '<' && s[j] != '>') j++;
+                    int run = j - (i + 1);
+                    if (run >= 1 && run <= 40 && j < n && s[j] == '>') end = j + 1;
+                }
+                else if (c == '\\')
+                {
+                    if (i + 1 < n && s[i + 1] == 'n') end = i + 2;
+                }
+                else if (c == '\n')
+                {
+                    end = i + 1;
+                }
+                else if (Digit(c))
+                {
+                    int j = i + 1;
+                    while (j < n && Digit(s[j])) j++;
+                    if (j + 1 < n && s[j] == '.' && Digit(s[j + 1]))
+                    {
+                        j += 2;
+                        while (j < n && Digit(s[j])) j++;
+                    }
+                    end = j;
+                }
+                if (end == 0) { i++; continue; }
+                tokens.Add(s.Substring(i, end - i));
+                i = end;
+            }
             tokens.Sort(StringComparer.Ordinal);
             return string.Join("\u0001", tokens);
         }

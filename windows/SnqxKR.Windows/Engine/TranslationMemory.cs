@@ -24,12 +24,14 @@ namespace SnqxKR.Engine
         private readonly long[] keys;     // 오름차순
         private readonly Texts values;
         private readonly int[] gens;
+        private readonly Lazy<int[]?> buckets; // Find 용 칸 색인 (BucketIndex). 처음 찾을 때 만든다
 
         private TranslationMemory(long[] keys, Texts values, int[] gens)
         {
             this.keys = keys;
             this.values = values;
             this.gens = gens;
+            buckets = new Lazy<int[]?>(() => BucketIndex(keys));
         }
 
         public int Count => keys.Length;
@@ -49,7 +51,53 @@ namespace SnqxKR.Engine
         }
 
         /// <summary>원문 해시(<see cref="Hash(byte[], int, int)"/>)로 찾은 줄 번호. 없으면 음수</summary>
-        public int Find(long hash) => Array.BinarySearch(keys, hash);
+        public int Find(long hash)
+        {
+            var b = buckets.Value;
+            int d = BucketOf(hash);
+            int from = b != null ? b[d] : 0;
+            int to = b != null ? b[d + 1] : keys.Length;
+            int i = LowerBound(keys, from, to, hash);
+            return i < to && keys[i] == hash ? i : -1;
+        }
+
+        /// <summary>칸 색인은 해시 상위 16비트로 나눈다 (65,537칸, 256KB)</summary>
+        private const int BucketBits = 16;
+
+        /// <summary>v 가 들어갈 칸. 부호 비트를 뒤집어 부호 있는 순서를 그대로 따른다</summary>
+        internal static int BucketOf(long v) => (int)((ulong)(v ^ long.MinValue) >> (64 - BucketBits));
+
+        /// <summary>
+        /// 오름차순 배열의 칸 색인: 칸 d 의 값은 a[r[d], r[d+1]) 에 있다. 해시는 고르게 퍼져 한 칸에 몇 개뿐이라
+        /// 이진 탐색이 전체(27만 줄이면 18단계) 대신 칸 안(2~3단계)에서 끝나고, 찾은 자리는 전체에서 찾은 것과 같다.
+        /// 엄격히 오름차순이 아니면(깨진 메모리 파일) null: 전체에서 <see cref="LowerBound"/> 로 찾는다.
+        /// </summary>
+        internal static int[]? BucketIndex(long[] a)
+        {
+            var r = new int[(1 << BucketBits) + 1];
+            for (int i = 0; i < a.Length; i++)
+            {
+                if (i > 0 && a[i] <= a[i - 1]) return null;
+                r[BucketOf(a[i]) + 1]++;
+            }
+            for (int d = 0; d < 1 << BucketBits; d++) r[d + 1] += r[d];
+            return r;
+        }
+
+        /// <summary>
+        /// a[from, to) 에서 v 이상인 첫 자리 (없으면 to). Kotlin·C++ 와 같은 순서로 반씩 나눠, 정렬이 깨진 배열에서도
+        /// 세 엔진이 같은 자리를 낸다 (Array.BinarySearch 는 나누는 방식이 달라 깨진 파일에서 다른 줄을 찾았다).
+        /// </summary>
+        internal static int LowerBound(long[] a, int from, int to, long v)
+        {
+            int lo = from, hi = to;
+            while (lo < hi)
+            {
+                int mid = lo + (hi - lo) / 2;
+                if (a[mid] < v) lo = mid + 1; else hi = mid;
+            }
+            return lo;
+        }
 
         /// <summary>원문으로 찾은 번역 (복사본. 시험·작은 곳용)</summary>
         public byte[]? Get(byte[] source)

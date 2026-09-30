@@ -656,16 +656,58 @@ std::vector<std::u16string> shape(const Text& t) {
 const uint32_t MAGIC_V1 = 0x534e514d;  // "SNQM": 세대 없음 (윈도우 0.2 는 리틀엔디안으로 썼다)
 const uint32_t MAGIC_V2 = 0x534e5132;  // "SNQ2"
 
+// 칸 색인은 해시 상위 16비트로 나눈다 (65,537칸, 256KB)
+const int BUCKET_BITS = 16;
+
+/** v 가 들어갈 칸. 부호 비트를 뒤집어 부호 있는 순서를 그대로 따른다 */
+inline size_t bucket_of(int64_t v) { return size_t((uint64_t(v) ^ 0x8000000000000000ULL) >> (64 - BUCKET_BITS)); }
+
+/**
+ * 오름차순 배열의 칸 색인: 칸 d 의 값은 a[r[d], r[d+1]) 에 있다. 해시는 고르게 퍼져 한 칸에 몇 개뿐이라
+ * 이진 탐색이 전체(27만 줄이면 18단계) 대신 칸 안(2~3단계)에서 끝나고, 찾은 자리는 전체에서 찾은 것과 같다.
+ * 엄격히 오름차순이 아니면(깨진 메모리 파일) 빈 것: 전체에서 [lower_bound_at] 으로 찾는다.
+ */
+std::vector<int32_t> bucket_index(const std::vector<int64_t>& a) {
+    std::vector<int32_t> r((size_t(1) << BUCKET_BITS) + 1, 0);
+    for (size_t i = 0; i < a.size(); i++) {
+        if (i > 0 && a[i] <= a[i - 1]) return {};
+        r[bucket_of(a[i]) + 1]++;
+    }
+    for (size_t d = 0; d + 1 < r.size(); d++) r[d + 1] += r[d];
+    return r;
+}
+
+/**
+ * a[from, to) 에서 v 이상인 첫 자리 (없으면 to). Kotlin·C# 와 같은 순서로 반씩 나눠, 정렬이 깨진 배열에서도
+ * 세 엔진이 같은 자리를 낸다 (std::lower_bound 는 표준 라이브러리마다 나누는 방식이 다를 수 있다).
+ */
+size_t lower_bound_at(const std::vector<int64_t>& a, size_t from, size_t to, int64_t v) {
+    size_t lo = from, hi = to;
+    while (lo < hi) {
+        size_t mid = (lo + hi) >> 1;
+        if (a[mid] < v) lo = mid + 1;
+        else hi = mid;
+    }
+    return lo;
+}
+
+/** a 에서 v 이상인 첫 자리. 칸 색인이 있으면 v 의 칸 안에서만 찾는다 */
+size_t lower_bound_in(const std::vector<int64_t>& a, const std::vector<int32_t>& buckets, int64_t v) {
+    if (buckets.empty()) return lower_bound_at(a, 0, a.size(), v);
+    size_t d = bucket_of(v);
+    return lower_bound_at(a, size_t(buckets[d]), size_t(buckets[d + 1]), v);
+}
+
 struct Memory {
     std::vector<int64_t> keys;  // 오름차순 (부호 있는 비교)
     std::vector<Text> values;
     std::vector<int32_t> gens;
 
-    /** 원문 해시로 찾은 위치, 없으면 -1 */
-    int64_t find(int64_t h) const {
-        auto it = std::lower_bound(keys.begin(), keys.end(), h);
-        if (it == keys.end() || *it != h) return -1;
-        return int64_t(it - keys.begin());
+    /** 원문 해시로 찾은 위치, 없으면 -1. buckets 는 keys 의 칸 색인 ([bucket_index]) */
+    int64_t find(int64_t h, const std::vector<int32_t>& buckets) const {
+        size_t i = lower_bound_in(keys, buckets, h);
+        if (i == keys.size() || keys[i] != h) return -1;
+        return int64_t(i);
     }
 
     int64_t byte_size() const {
@@ -756,7 +798,8 @@ Memory build_memory(const Table& official, const Table& patch) {
 
 /** 같은 원문이면 newer 가 이기고, newer 의 줄은 새 세대가 된다 */
 Memory merge(const Memory& old, const Memory& newer) {
-    int32_t gen = (old.gens.empty() ? -1 : *std::max_element(old.gens.begin(), old.gens.end())) + 1;
+    // 최대 세대 + 1. 깨진 파일의 INT32_MAX 에서 Kotlin·C# 처럼 돌아가게 부호 없는 덧셈으로 (부호 있는 넘침은 정의되지 않은 동작)
+    int32_t gen = old.gens.empty() ? 0 : int32_t(uint32_t(*std::max_element(old.gens.begin(), old.gens.end())) + 1u);
     Memory m;
     size_t i = 0, j = 0;
     m.keys.reserve(old.keys.size() + newer.keys.size());
@@ -854,6 +897,7 @@ int overlay(const Table& official, std::vector<Text>& texts, std::vector<uint8_t
     std::vector<int64_t> packed(N);
     for (size_t i = 0; i < N; i++) packed[i] = (nh[i] & ~low) | int64_t(i);
     std::sort(packed.begin(), packed.end());
+    const std::vector<int32_t> packed_buckets = bucket_index(packed);  // 위치가 붙어 값이 모두 달라 늘 만들어진다
 
     auto next_ok = [&](size_t a, size_t b) {
         return a + 1 < O && b + 1 < N && o_next[a] && n_next[b] && oh[a + 1] != 0 && oh[a + 1] == nh[b + 1];
@@ -867,7 +911,7 @@ int overlay(const Table& official, std::vector<Text>& texts, std::vector<uint8_t
         int64_t h = oh[a];
         if (h == 0) continue;
         int64_t hi = h & ~low;
-        size_t first = size_t(std::lower_bound(packed.begin(), packed.end(), hi) - packed.begin());
+        size_t first = lower_bound_in(packed, packed_buckets, hi);
         size_t k = first;
         while (k < N && (packed[k] & ~low) == hi) k++;
         if (k - first > size_t(MAX_CANDIDATES)) continue;
@@ -936,13 +980,15 @@ RepairResult repair(const Table& official, const Memory& tm, const Table* old, c
         value_key.assign(tm.keys.size(), 0);
         parallel_for(value_key.size(), [&](size_t s, size_t e) { for (size_t j = s; j < e; j++) value_key[j] = key(tm.values[j]); });
     }
-    // 1단계: 원문 해시로 번역 메모리를 찾는다 (여러 스레드, Id 순으로 돌아 2단계 키를 바로 그 자리에 쓴다)
+    // 1단계: 원문 해시로 번역 메모리를 찾는다 (여러 스레드, Id 순으로 돌아 2단계 키를 바로 그 자리에 쓴다).
+    // 칸 색인은 스레드를 나누기 전에 만든다 (스레드들은 읽기만)
+    const std::vector<int32_t> tm_buckets = bucket_index(tm.keys);
     parallel_for(n, [&](size_t s, size_t e) {
         for (size_t k = s; k < e; k++) {
             size_t i = size_t(no[k]);
             Text zh = official.text(i);
             int64_t h = hash64(zh);  // 빈 문장도 해시로 찾는다 (Kotlin·C# 과 같음)
-            int64_t at = tm.find(h);
+            int64_t at = tm.find(h, tm_buckets);
             if (at >= 0) {
                 texts[i] = tm.values[size_t(at)];
                 changed[i] = 1;
