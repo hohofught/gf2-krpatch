@@ -100,6 +100,10 @@ class PatchRepository(private val app: Context) {
     fun layoutFor(sha: String): String? = prefs.getString("layout:$sha", null)
     fun putLayout(sha: String, layout: String) = prefs.edit().putString("layout:$sha", layout).apply()
 
+    /** (한패, 공식 원문) 짝의 자리 검사 결과 "번역안된줄/같은자리" */
+    fun alignmentFor(key: String): String? = prefs.getString("align:$key", null)
+    fun putAlignment(key: String, value: String) = prefs.edit().putString("align:$key", value).apply()
+
     /**
      * 백그라운드 확인. 기본은 꺼짐: 켜지 않으면 예약 작업 자체가 없어서 폰을 깨우지 않는다.
      * (1.0 은 이 값을 쓰지 않았으므로 기존 값이 있어도 새 키로 시작한다)

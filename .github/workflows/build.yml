@@ -32,23 +32,30 @@ jobs:
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
 
+      # native 판(libsnqx.so)을 빌드할 NDK·CMake (app/build.gradle.kts 의 ndkVersion 과 같게)
+      - name: Install NDK and CMake
+        run: sdkmanager --install "ndk;30.0.16248370" "cmake;4.1.2" > /dev/null
+
       - name: Decode signing key
         if: env.RELEASE_KEYSTORE_B64 != ''
         run: |
           echo "$RELEASE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
           echo "RELEASE_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
 
-      - name: Build release APK
+      # 두 가지: kotlin (모든 기기, 앱 코드 엔진) / native (arm64, C++ 엔진 libsnqx.so)
+      - name: Build release APKs
         env:
           RELEASE_KEYSTORE_PASSWORD: ${{ secrets.RELEASE_KEYSTORE_PASSWORD }}
           RELEASE_KEY_ALIAS: ${{ secrets.RELEASE_KEY_ALIAS }}
           RELEASE_KEY_PASSWORD: ${{ secrets.RELEASE_KEY_PASSWORD }}
-        run: ./gradlew assembleRelease --stacktrace
+        run: ./gradlew assembleKotlinRelease assembleNativeRelease --stacktrace
 
-      - name: Collect APK
+      - name: Collect APKs
         run: |
           mkdir -p out
-          cp app/build/outputs/apk/release/app-release.apk "out/snqx-krpatch-${GITHUB_REF_NAME//\//-}.apk"
+          tag="${GITHUB_REF_NAME//\//-}"
+          cp app/build/outputs/apk/kotlin/release/app-kotlin-release.apk "out/snqx-krpatch-${tag}.apk"
+          cp app/build/outputs/apk/native/release/app-native-release.apk "out/snqx-krpatch-${tag}-native-arm64.apk"
           sha256sum out/*.apk | tee -a "$GITHUB_STEP_SUMMARY"
 
       - name: Upload artifact

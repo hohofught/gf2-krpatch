@@ -136,7 +136,92 @@ class LangTableTest {
                 "  실제 현재 한패와 비교: 같은 번역 ${c.same}, 다른 번역 ${c.conflicting}, 한패는 번역했는데 복구는 중국어 ${c.missing}"
         )
         c.examples.forEach { println("    예) $it") }
-        assert(result.coverage > 0.85) { "복구율이 너무 낮음: ${result.coverage}" }
+        // 윈도우 C# 엔진(SnqxKR.EngineCheck)·네이티브 엔진과 같은 숫자여야 한다
+        assertEquals(252684, tm.size)
+        assertEquals(463540, result.translated)
+        assertEquals(30599, result.leftChinese)
+    }
+
+    /**
+     * 업데이트 직후 올라온 한패는 번역이 엉뚱한 자리에 들어 있었다 (GitHub 이력).
+     * 샘플 폴더의 history/ 에 커밋별 한패가 있을 때만 돈다.
+     */
+    @Test
+    fun `공식 원문과 자리가 맞지 않는 한패를 가려낸다`() {
+        val v1 = LangTable.read(sample("official-pc-current.bytes"))
+        val v4 = LangTable.read(sample("official-0824.bytes"))
+        val cases = listOf(
+            Triple(v1, "history/20260922-0725-0cce1eb.bytes", false), // 09-22: 전부 어긋남
+            Triple(v1, "history/20260927-1419-76f18c5.bytes", true),
+            Triple(v4, "history/20260811-1111-0398002.bytes", false), // 08-11: 일부 섞임
+            Triple(v4, "history/20260827-0119-810ed14.bytes", true),
+        )
+        for ((official, name, expected) in cases) {
+            val a = PatchRepair.alignment(official, LangTable.read(sample(name)))
+            println("  $name: 번역 안 된 줄 ${a.untranslated} 중 원문과 같은 자리 ${a.matching} (${PatchRepairPercent(a.ratio)})")
+            assertEquals(name, expected, a.ok)
+        }
+    }
+
+    /**
+     * 폰에서 흔한 경우: 번역 메모리는 08월(V4) 것인데 게임에는 09-19(V2) 한패를 쓰고 있었고, 게임이 V1 로 업데이트됐다.
+     * 2단계로 V2 한패의 번역을 V1 자리로 옮기면 실제 V1 한패와 같은 줄이 늘어야 하고, 옮긴 줄은 대부분 V1 한패와 같아야 한다.
+     */
+    @Test
+    fun `옛 한패 번역을 새 버전 자리로 옮긴다`() {
+        val tm = TranslationMemory.build(LangTable.read(sample("official-0824.bytes")), LangTable.read(sample("patch-0827.bytes")))
+        val official = LangTable.read(sample("official-pc-current.bytes"))
+        val oldPatch = LangTable.read(sample("patch-v2-0919.bytes"))
+        val truth = LangTable.read(sample("patch-current.bytes"))
+        val only = PatchRepair.repair(official, tm)
+        val both = PatchRepair.repair(official, tm, oldPatch)
+        val a = compare(official, only.table, truth)
+        val b = compare(official, both.table, truth)
+        // 옮긴 줄만 따로: 실제 V1 한패와 같은 비율
+        var moved = 0; var movedSame = 0
+        val byId = HashMap<Long, ByteArray>(truth.size).apply { for (i in 0 until truth.size) put(truth.ids[i], truth.texts[i]) }
+        for (i in 0 until official.size) {
+            if (both.table.texts[i].contentEquals(only.table.texts[i])) continue
+            moved++
+            if (both.table.texts[i].contentEquals(byId[official.ids[i]])) movedSame++
+        }
+        println(
+            "  메모리만: 한국어 ${only.translated}, V1 한패와 같음 ${a.same}\n" +
+                "  옛 한패까지: 한국어 ${both.translated} (옮김 ${both.fromPatch}), V1 한패와 같음 ${b.same}\n" +
+                "  옮긴 줄 $moved 중 V1 한패와 같음 $movedSame (${PatchRepairPercent(movedSame.toDouble() / moved.coerceAtLeast(1))})"
+        )
+        assertEquals(moved, both.fromPatch)
+        assert(b.same > a.same + 4000) { "옛 한패로 늘어난 줄이 너무 적음: ${a.same} → ${b.same}" }
+        assert(movedSame >= moved * 0.95) { "옮긴 줄의 정확도가 낮음: $movedSame / $moved" }
+    }
+
+    @Test
+    fun `번역 메모리는 새 세대가 이기고 최대 크기를 넘으면 오래된 세대부터 뺀다`() {
+        fun table(vararg rows: Pair<String, String>) =
+            LangTable(LongArray(rows.size) { it + 1L }, Array(rows.size) { rows[it].first.toByteArray() }) to
+                LangTable(LongArray(rows.size) { it + 1L }, Array(rows.size) { rows[it].second.toByteArray() })
+        val (o1, p1) = table("甲" to "갑", "乙" to "을", "丙" to "병")
+        val (o2, p2) = table("乙" to "을2", "丁" to "정")
+        val old = TranslationMemory.build(o1, p1)
+        val merged = old.mergedWith(TranslationMemory.build(o2, p2))
+        assertEquals(4, merged.size)
+        assertEquals("을2", String(merged["乙".toByteArray()]!!))
+        assertEquals("갑", String(merged["甲".toByteArray()]!!))
+
+        // 한 줄 = 16바이트 + 번역 길이(3). 두 줄만 남게 자르면 새 세대(乙, 丁)가 남는다
+        val capped = merged.capped(8L + 2 * (16 + 4))
+        assertEquals(2, capped.size)
+        assertEquals(null, capped["甲".toByteArray()])
+        assertEquals("정", String(capped["丁".toByteArray()]!!))
+
+        // 저장 후 읽어도 세대가 남아 다음 합치기에서 이어진다
+        val f = File.createTempFile("snqx-tm", ".bin").apply { deleteOnExit() }
+        merged.writeTo(f)
+        val back = TranslationMemory.read(f)
+        assertEquals(merged.byteSize, f.length())
+        assertEquals(merged.byteSize, back.byteSize)
+        val again = back.mergedWith(TranslationMemory.build(table("戊" to "무").first, table("戊" to "무").second)).capped(8L + 16 + 3)
+        assertEquals("무", String(again["戊".toByteArray()]!!))
     }
 
     private data class Comparison(val same: Int, val conflicting: Int, val missing: Int, val examples: List<String>)
@@ -171,7 +256,7 @@ class LangTableTest {
         tm.writeTo(f)
         val back = TranslationMemory.read(f)
         assertEquals(tm.size, back.size)
-        val probe = official.texts.first { tm[it] != null }
+        val probe = official.texts[(0 until official.size).first { tm[official.texts[it]] != null }]
         assertArrayEquals(tm[probe], back[probe])
     }
 }

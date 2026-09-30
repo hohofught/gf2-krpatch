@@ -21,6 +21,40 @@ android {
         buildConfig = true
     }
 
+    // 번역 엔진으로 두 가지를 만든다.
+    //  kotlin: 앱 코드(Kotlin) 엔진만. 모든 기기
+    //  native: C++ 엔진(libsnqx.so, armv8-a)을 넣은 판. arm64-v8a 기기만. .so 를 못 올리면 Kotlin 엔진을 쓴다
+    ndkVersion = "30.0.16248370"
+    externalNativeBuild {
+        cmake {
+            path = file("../native/CMakeLists.txt")
+            version = "4.1.2"
+        }
+    }
+    flavorDimensions += "engine"
+    productFlavors {
+        create("kotlin") {
+            dimension = "engine"
+            buildConfigField("boolean", "NATIVE_ENGINE", "false")
+            // CMake 는 설정만 하고 아무것도 빌드하지 않는다 (.so 없음). 인자를 달리해 native 판과 빌드 폴더를 나눈다.
+            // (ndk.abiFilters 를 쓰면 라이브러리들의 다른 CPU 용 .so 까지 빠지므로 CMake 쪽만 줄인다)
+            externalNativeBuild {
+                cmake {
+                    targets += "snqx_none"
+                    arguments += "-DSNQX_ENGINE=none"
+                    abiFilters += "arm64-v8a"
+                }
+            }
+        }
+        create("native") {
+            dimension = "engine"
+            versionNameSuffix = "-native"
+            buildConfigField("boolean", "NATIVE_ENGINE", "true")
+            ndk { abiFilters += "arm64-v8a" }
+            externalNativeBuild { cmake { targets += "snqx" } }
+        }
+    }
+
     // RELEASE_KEYSTORE 환경변수가 있으면 그 키로, 없으면 디버그 키로 서명한다.
     // (CI 시크릿을 넣지 않아도 빌드가 되게 하되, 넣으면 업데이트 설치가 가능한 고정 키로 서명)
     val releaseKeystore = System.getenv("RELEASE_KEYSTORE")

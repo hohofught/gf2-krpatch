@@ -8,8 +8,8 @@ using System.Text;
 namespace SnqxKR
 {
     /// <summary>
-    /// 앱 데이터 (설정·한패 캐시·공식 원본 보관·번역 메모리).
-    /// 포터블: exe 옆 SnqxKR-data 폴더에 둔다. 거기에 쓸 수 없으면(Program Files 등) %LOCALAPPDATA%\SnqxKR.
+    /// 앱 데이터 (설정·한패 캐시·공식 원본 보관·번역 메모리)는 %LOCALAPPDATA%\SnqxKR 에 둔다.
+    /// 수백 MB 가 될 수 있어 로밍 프로필(AppData\Roaming)이 아니라 Local 이다. exe 는 어디에 두든 같은 데이터를 쓴다.
     /// 설정은 key=value 한 줄씩인 settings.ini.
     /// </summary>
     public sealed class Store
@@ -19,10 +19,17 @@ namespace SnqxKR
         private readonly Dictionary<string, string> map = new Dictionary<string, string>(StringComparer.Ordinal);
         private readonly object gate = new object();
 
+        /// <summary>0.2 의 exe 옆 데이터 폴더를 옮겼으면 그 경로</summary>
+        public string? MigratedFrom { get; private set; }
+        /// <summary>옮기다 실패했으면 그 이유 (남은 파일은 다음 실행 때 다시 옮긴다)</summary>
+        public string? MigrationError { get; private set; }
+
         public Store()
         {
-            Root = PickRoot();
+            Root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SnqxKR");
+            Directory.CreateDirectory(Root);
             settingsPath = Path.Combine(Root, "settings.ini");
+            MigrateFrom(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SnqxKR-data"));
             if (File.Exists(settingsPath))
             {
                 foreach (var line in File.ReadAllLines(settingsPath, Encoding.UTF8))
@@ -33,28 +40,45 @@ namespace SnqxKR
             }
         }
 
-        private static string PickRoot()
+        /// <summary>
+        /// 0.2 는 exe 옆 SnqxKR-data 에 저장했다. 새 위치에 설정이 없을 때 한 번 옮긴다.
+        /// settings.ini 는 맨 마지막에 옮겨서, 중간에 끊겨도 다음 실행 때 나머지를 마저 옮긴다.
+        /// </summary>
+        private void MigrateFrom(string old)
         {
-            var portable = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "SnqxKR-data");
-            if (CanWrite(portable)) return portable;
-            var local = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "SnqxKR");
-            Directory.CreateDirectory(local);
-            return local;
-        }
-
-        private static bool CanWrite(string dir)
-        {
+            if (!Directory.Exists(old) || File.Exists(settingsPath)) return;
             try
             {
-                Directory.CreateDirectory(dir);
-                var probe = Path.Combine(dir, ".write-test");
-                File.WriteAllText(probe, "");
-                File.Delete(probe);
-                return true;
+                var oldSettings = Path.Combine(old, "settings.ini");
+                var files = Directory.GetFiles(old, "*", SearchOption.AllDirectories)
+                    .OrderBy(f => string.Equals(f, oldSettings, StringComparison.OrdinalIgnoreCase) ? 1 : 0);
+                foreach (var src in files)
+                {
+                    var dst = Path.Combine(Root, src.Substring(old.Length).TrimStart('\\'));
+                    Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
+                    if (File.Exists(dst)) File.Delete(src);
+                    else File.Move(src, dst); // 드라이브가 달라도 파일은 옮겨진다 (복사 후 삭제)
+                }
+                foreach (var dir in Directory.GetDirectories(old, "*", SearchOption.AllDirectories).OrderByDescending(d => d.Length))
+                    if (!Directory.EnumerateFileSystemEntries(dir).Any()) Directory.Delete(dir);
+                if (!Directory.EnumerateFileSystemEntries(old).Any()) Directory.Delete(old);
+                MigratedFrom = old;
             }
-            catch
+            catch (Exception e)
             {
-                return false;
+                MigrationError = e.Message;
+            }
+        }
+
+        /// <summary>조건에 맞는 설정 키를 지운다 (모든 설치의 공식 원본 기록 초기화 등)</summary>
+        public void RemoveKeys(Func<string, bool> match)
+        {
+            lock (gate)
+            {
+                var keys = map.Keys.Where(match).ToList();
+                if (keys.Count == 0) return;
+                foreach (var key in keys) map.Remove(key);
+                Save();
             }
         }
 
@@ -69,11 +93,16 @@ namespace SnqxKR
             {
                 if (map.TryGetValue(key, out var old) && old == value) return;
                 map[key] = value.Replace("\r", " ").Replace("\n", " ");
-                var tmp = settingsPath + ".tmp";
-                File.WriteAllLines(tmp, map.OrderBy(kv => kv.Key).Select(kv => kv.Key + "=" + kv.Value), Encoding.UTF8);
-                if (File.Exists(settingsPath)) File.Replace(tmp, settingsPath, null);
-                else File.Move(tmp, settingsPath);
+                Save();
             }
+        }
+
+        private void Save()
+        {
+            var tmp = settingsPath + ".tmp";
+            File.WriteAllLines(tmp, map.OrderBy(kv => kv.Key).Select(kv => kv.Key + "=" + kv.Value), Encoding.UTF8);
+            if (File.Exists(settingsPath)) File.Replace(tmp, settingsPath, null);
+            else File.Move(tmp, settingsPath);
         }
 
         public long GetLong(string key) => long.TryParse(Get(key), out var v) ? v : 0;

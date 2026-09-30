@@ -135,7 +135,8 @@ object Notices {
     fun decide(engine: PatchEngine, game: GamePkg, info: Inspection, patchLayout: String): Notice? {
         val repo = engine.repo
         if (!used(repo, game.pkg)) return null
-        val matches = info.gameLayout.isNotEmpty() && info.gameLayout == patchLayout
+        // 버전이 같아도 문장 자리가 원문과 어긋난 한패는 "정식 한패"로 알리지 않는다
+        val matches = info.gameLayout.isNotEmpty() && info.gameLayout == patchLayout && info.patchAligned != false
         return when {
             info.status == PatchStatus.OFFICIAL && !matches && repo.notifyUnpatched -> Notice(
                 "broken:" + info.gameLayout, CHANNEL_UNPATCHED,

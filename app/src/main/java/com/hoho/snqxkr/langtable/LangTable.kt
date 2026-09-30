@@ -3,9 +3,11 @@ package com.hoho.snqxkr.langtable
 import java.io.ByteArrayOutputStream
 import java.io.EOFException
 import java.io.File
+import java.io.FileOutputStream
 import java.io.InputStream
 import java.io.OutputStream
 import java.io.RandomAccessFile
+import java.nio.ByteBuffer
 import java.security.MessageDigest
 
 /**
@@ -15,15 +17,19 @@ import java.security.MessageDigest
  *  본문: repeated TextMap { int64 Id = 1; string Content = 2 }
  *  색인: 1 = 청크 크기(10), 2 = 1, 3 = repeated { 청크 번호(Id/10), { 본문 내 offset, size } }
  *
- * 문장은 UTF-8 바이트 그대로 들고 있는다 (String 으로 바꾸면 메모리가 두 배 든다).
- * 빈 문장은 빈 배열이다 (proto3 는 빈 문자열 필드를 생략한다).
+ * 문장은 UTF-8 바이트 그대로다 (String 으로 바꾸면 메모리가 두 배 든다). [read] 는 파일을 매핑하고
+ * 문장마다 파일 안의 자리만 들고 있다 ([Texts]). 빈 문장은 길이 0 이다 (proto3 는 빈 문자열 필드를 생략한다).
  */
 class LangTable(
     val ids: LongArray,
-    val texts: Array<ByteArray>,
+    val texts: Texts,
     val chunkSize: Long = 10,
     val headerFlag: Long = 1,
 ) {
+    /** 바이트 배열들로 (시험·작은 표용) */
+    constructor(ids: LongArray, texts: Array<ByteArray>, chunkSize: Long = 10, headerFlag: Long = 1) :
+        this(ids, Texts.of(texts), chunkSize, headerFlag)
+
     init {
         require(ids.size == texts.size)
     }
@@ -33,75 +39,91 @@ class LangTable(
     /** 게임 버전 구분용 지문 ([layoutKeyOf]) */
     fun layoutKey(): String = layoutKeyOf(ids)
 
-    /** Id 오름차순으로 늘어선 위치 */
-    fun sortedOrder(): IntArray = (0 until size).sortedBy { ids[it] }.toIntArray()
+    private val order: IntArray by lazy { sortedOrderOf(ids) }
+
+    /** Id 오름차순으로 늘어선 위치 (처음 한 번만 계산한다. 고치지 말 것) */
+    fun sortedOrder(): IntArray = order
+
+    /** 다른 표와 Id 집합이 같은지 (같은 게임 버전) */
+    fun sameIds(other: LangTable): Boolean {
+        if (size != other.size) return false
+        val a = sortedOrder()
+        val b = other.sortedOrder()
+        for (k in a.indices) if (ids[a[k]] != other.ids[b[k]]) return false
+        return true
+    }
 
     /**
      * 커뮤니티 한패와 같은 모양으로 쓴다: Id 오름차순 본문 + 청크 색인(청크 번호 내림차순).
      * 한패 파일로 파싱 → 재작성하면 원본과 바이트 단위로 같다.
      */
     fun toBytes(): ByteArray {
-        val body = ByteArrayOutputStream(texts.sumOf { it.size + 16 })
-        val header = headerBytes(writeBody(body))
-        val out = ByteArrayOutputStream(4 + header.size + body.size())
-        out.writeU32le(header.size)
-        out.write(header)
-        body.writeTo(out)
+        val plan = plan()
+        val out = ByteArrayOutputStream((4 + plan.header.size + plan.bodySize).toInt())
+        BlockWriter(out, null).use { w ->
+            w.u32le(plan.header.size); w.bytes(plan.header); writeBody(w, plan.order)
+        }
         return out.toByteArray()
     }
 
-    /** [toBytes] 와 같은 내용을 파일로. 본문을 임시 파일로 흘려 써서 메모리를 적게 쓴다. */
-    fun writeTo(file: File) {
+    /**
+     * [toBytes] 와 같은 내용을 파일로 쓰고 SHA-256(소문자 16진수)을 돌려준다.
+     * 색인을 먼저 계산해서 한 번에 흘려 쓰고(임시 파일 없음), 해시도 쓰면서 같이 구한다 (다시 읽지 않음).
+     */
+    fun writeTo(file: File): String {
         file.parentFile?.mkdirs()
-        val bodyTmp = File(file.parentFile, file.name + ".body")
-        try {
-            val chunks = bodyTmp.outputStream().buffered(1 shl 16).use { writeBody(it) }
-            val header = headerBytes(chunks)
-            file.outputStream().buffered(1 shl 16).use { out ->
-                out.writeU32le(header.size)
-                out.write(header)
-                bodyTmp.inputStream().use { it.copyTo(out, 1 shl 16) }
+        val plan = plan()
+        val md = MessageDigest.getInstance("SHA-256")
+        FileOutputStream(file).use { fos ->
+            BlockWriter(fos, md).use { w ->
+                w.u32le(plan.header.size); w.bytes(plan.header); writeBody(w, plan.order)
             }
-        } finally {
-            bodyTmp.delete()
         }
+        return hex(md.digest())
     }
 
-    private class Chunks {
-        val ids = LongArrayBuilder()
-        val offsets = LongArrayBuilder()
-        val sizes = LongArrayBuilder()
-    }
+    private class Plan(val order: IntArray, val header: ByteArray, val bodySize: Long)
 
-    /** Id 오름차순으로 본문을 쓰며 청크(Id/10)마다 offset·size 를 모은다. 같은 청크는 본문에서 연속이다. */
-    private fun writeBody(sink: OutputStream): Chunks {
-        val out = CountingOutput(sink)
-        val chunks = Chunks()
+    /** 쓰기 전에 줄마다 크기를 계산해 청크(Id/10)마다 offset·size 를 모은다. 같은 청크는 본문에서 연속이다. */
+    private fun plan(): Plan {
+        val order = sortedOrder()
+        val cids = LongArrayBuilder()
+        val offs = LongArrayBuilder()
+        val lens = LongArrayBuilder()
+        var pos = 0L
         var lastChunk = Long.MIN_VALUE
         var chunkStart = 0L
-        for (i in sortedOrder()) {
+        for (i in order) {
             val id = ids[i]
-            val text = texts[i]
-            val inner = (if (id != 0L) 1 + varintSize(id) else 0) +
-                (if (text.isNotEmpty()) 1 + varintSize(text.size.toLong()) + text.size else 0)
+            val inner = innerSize(id, texts.length(i))
             val cid = id / chunkSize
             if (cid != lastChunk) {
-                if (lastChunk != Long.MIN_VALUE) chunks.sizes.add(out.count - chunkStart)
-                chunks.ids.add(cid); chunks.offsets.add(out.count)
-                lastChunk = cid; chunkStart = out.count
+                if (lastChunk != Long.MIN_VALUE) lens.add(pos - chunkStart)
+                cids.add(cid); offs.add(pos)
+                lastChunk = cid; chunkStart = pos
             }
-            out.write(0x0a); out.putVarint(inner.toLong())
-            if (id != 0L) { out.write(0x08); out.putVarint(id) }
-            if (text.isNotEmpty()) { out.write(0x12); out.putVarint(text.size.toLong()); out.write(text) }
+            pos += 1 + varintSize(inner.toLong()) + inner
         }
-        if (lastChunk != Long.MIN_VALUE) chunks.sizes.add(out.count - chunkStart)
-        out.flush()
-        return chunks
+        if (lastChunk != Long.MIN_VALUE) lens.add(pos - chunkStart)
+        return Plan(order, headerBytes(cids.toArray(), offs.toArray(), lens.toArray()), pos)
     }
 
+    private fun writeBody(w: BlockWriter, order: IntArray) {
+        val c = texts.cursor()
+        for (i in order) {
+            val id = ids[i]
+            val n = texts.length(i)
+            w.byte(0x0a); w.varint(innerSize(id, n).toLong())
+            if (id != 0L) { w.byte(0x08); w.varint(id) }
+            if (n > 0) { w.byte(0x12); w.varint(n.toLong()); c.load(i); w.bytes(c.bytes, n) }
+        }
+    }
+
+    private fun innerSize(id: Long, n: Int): Int =
+        (if (id != 0L) 1 + varintSize(id) else 0) + (if (n > 0) 1 + varintSize(n.toLong()) + n else 0)
+
     /** 색인: 상수 두 개 + 청크 목록(청크 번호 내림차순, 원본 한패와 같은 순서) */
-    private fun headerBytes(chunks: Chunks): ByteArray {
-        val cids = chunks.ids.toArray(); val offs = chunks.offsets.toArray(); val lens = chunks.sizes.toArray()
+    private fun headerBytes(cids: LongArray, offs: LongArray, lens: LongArray): ByteArray {
         val header = ByteArrayOutputStream(cids.size * 16 + 8)
         header.write(0x08); header.putVarint(chunkSize)
         header.write(0x10); header.putVarint(headerFlag)
@@ -119,81 +141,135 @@ class LangTable(
     }
 
     companion object {
-        fun read(file: File): LangTable = parse(file.readBytes())
+        /**
+         * 파일을 매핑하고 줄마다 Id 와 문장 자리(시작·길이)만 만든다. 문장은 복사하지 않아
+         * 힙에는 줄마다 16바이트만 남는다 (49만 줄 표 하나에 8MB). 결과는 [parse] 와 같다.
+         */
+        fun read(file: File): LangTable = parse(Texts.map(file))
 
-        fun parse(b: ByteArray): LangTable {
-            val r = Reader(b)
-            val headerLen = (b[0].toLong() and 0xff) or ((b[1].toLong() and 0xff) shl 8) or
-                ((b[2].toLong() and 0xff) shl 16) or ((b[3].toLong() and 0xff) shl 24)
+        /** 메모리에 올린 파일 내용을 읽는다 (시험용·작은 파일용. 앱은 [read] 로 매핑해 읽는다) */
+        fun parse(b: ByteArray): LangTable = parse(ByteBuffer.wrap(b))
+
+        private fun parse(b: ByteBuffer): LangTable {
+            val size = b.capacity()
+            require(size >= 4) { "파일이 너무 작음" }
+            val r = BufReader(b, size)
+            val headerLen = r.u32le()
+            require(headerLen <= size - 4L) { "색인 길이가 파일보다 큼" }
             val bodyStart = 4 + headerLen.toInt()
-            require(headerLen >= 0 && bodyStart <= b.size) { "색인 길이가 파일보다 큼" }
+            val (chunkSize, flag) = headerConstants(BufReader(b, bodyStart).also { it.p = 4 }, bodyStart)
 
-            // 색인 앞의 상수 두 개만 읽는다 (청크 목록은 쓸 때 다시 계산한다)
-            var chunkSize = 10L
-            var flag = 1L
-            r.p = 4
-            while (r.p < bodyStart) {
-                val tag = r.varint()
-                when ((tag and 7).toInt()) {
-                    0 -> { val v = r.varint(); if (tag ushr 3 == 1L) chunkSize = v else if (tag ushr 3 == 2L) flag = v }
-                    2 -> {
-                        // r.p += r.varint() 는 varint 가 p 를 옮기기 전 값을 더하므로 나눠 쓴다
-                        val len = r.varint().toInt()
-                        r.p += len
-                    }
-                    else -> error("색인 wire type " + (tag and 7))
-                }
-            }
-
-            val ids = LongArrayBuilder()
-            val texts = ArrayList<ByteArray>()
+            // 줄 수를 먼저 세어 배열을 딱 맞게 잡는다 (두 배씩 늘리며 복사하지 않게)
+            val count = countEntries(b, bodyStart, size)
+            val ids = LongArray(count)
+            val offs = IntArray(count)
+            val lens = IntArray(count)
+            var k = 0
             r.p = bodyStart
-            while (r.p < b.size) {
+            while (r.p < size) {
                 val tag = r.varint()
                 require(tag == 0x0aL) { "본문 태그 $tag @ ${r.p}" }
-                val len = r.varint().toInt()
-                val end = r.p + len
+                val len = r.varint()
+                require(len in 0..(size - r.p).toLong()) { "본문이 끊김" }
+                val end = r.p + len.toInt()
                 var id = 0L
-                var text = EMPTY
+                var off = 0
+                var l = 0
                 while (r.p < end) {
                     val t = r.varint()
                     when ((t and 7).toInt()) {
                         0 -> { val v = r.varint(); if (t ushr 3 == 1L) id = v }
                         2 -> {
-                            val l = r.varint().toInt()
-                            if (t ushr 3 == 2L) text = b.copyOfRange(r.p, r.p + l)
-                            r.p += l
+                            val x = r.varint()
+                            require(x in 0..(end - r.p).toLong()) { "문장이 끊김" }
+                            if (t ushr 3 == 2L) { off = r.p; l = x.toInt() }
+                            r.p += x.toInt()
                         }
                         else -> error("본문 wire type " + (t and 7))
                     }
                 }
-                ids.add(id); texts.add(text)
-                r.p = end
+                // 안쪽 필드가 한 줄의 끝을 넘으면 깨진 파일 (C#·C++ 엔진과 같은 규칙)
+                require(r.p == end) { "본문 한 줄이 제 길이를 넘음" }
+                check(k < count) // 미리 센 곳에서 틀이 깨졌으면 위에서 이미 오류가 났다
+                ids[k] = id; offs[k] = off; lens[k] = l; k++
             }
-            return LangTable(ids.toArray(), texts.toTypedArray(), chunkSize, flag)
+            return LangTable(ids, Texts(arrayOf(b), null, offs, lens), chunkSize, flag)
+        }
+
+        /** 본문 줄 수. 틀(태그·길이)이 깨진 곳에서 멈춘다 — 그 줄은 본 읽기가 같은 검사로 오류를 낸다 */
+        private fun countEntries(b: ByteBuffer, start: Int, size: Int): Int {
+            val r = BufReader(b, size)
+            r.p = start
+            var n = 0
+            try {
+                while (r.p < size) {
+                    if (r.varint() != 0x0aL) break
+                    val len = r.varint()
+                    if (len < 0 || len > size - r.p) break
+                    r.p += len.toInt()
+                    n++
+                }
+            } catch (e: java.io.IOException) {
+                // 끊긴 varint: 본 읽기가 같은 자리에서 오류를 낸다
+            }
+            return n
+        }
+
+        /** 색인 앞의 상수 두 개(청크 크기, 1)만 읽는다. 청크 목록은 쓸 때 다시 계산한다. */
+        private fun headerConstants(r: BufReader, end: Int): Pair<Long, Long> {
+            var chunkSize = 10L
+            var flag = 1L
+            while (r.p < end) {
+                val tag = r.varint()
+                when ((tag and 7).toInt()) {
+                    0 -> { val v = r.varint(); if (tag ushr 3 == 1L) chunkSize = v else if (tag ushr 3 == 2L) flag = v }
+                    2 -> {
+                        // r.p += r.varint() 는 varint 가 p 를 옮기기 전 값을 더하므로 나눠 쓴다.
+                        // 길이가 음수이거나 남은 것보다 크면 깨진 파일 (그대로 두면 p 가 뒤로 가 끝없이 돈다)
+                        val len = r.varint()
+                        require(len in 0..(end - r.p).toLong()) { "색인이 끊김" }
+                        r.p += len.toInt()
+                    }
+                    else -> error("색인 wire type " + (tag and 7))
+                }
+            }
+            require(r.p == end) { "색인이 제 길이를 넘음" }
+            return chunkSize to flag
         }
 
         /** 본문의 Id 만 읽는다. 문장은 건너뛰어 메모리를 거의 쓰지 않는다 (버전 지문용). */
-        fun readIds(file: File): LongArray = file.inputStream().buffered(1 shl 16).use { readIds(it) }
+        fun readIds(file: File): LongArray = file.inputStream().use { readIds(it, file.length()) }
 
-        fun readIds(input: InputStream): LongArray {
+        /**
+         * size: 스트림 전체 크기. 길이 값이 남은 크기를 넘으면 깨진 파일로 본다
+         * (InputStream.skip 은 파일 끝을 넘어가도 조용히 성공해서, 확인하지 않으면 잘린 파일도 일부 Id 로 지문을 만든다)
+         */
+        fun readIds(input: InputStream, size: Long): LongArray {
             val s = StreamReader(input)
-            s.skip(s.u32le())
+            val headerLen = s.u32le()
+            require(headerLen <= size - 4) { "색인 길이가 파일보다 큼" }
+            s.skip(headerLen)
             val ids = LongArrayBuilder()
             while (true) {
                 val tag = s.varintOrEof() ?: break
                 require(tag == 0x0aL) { "본문 태그 $tag" }
                 val len = s.varint()
+                require(len in 0..(size - s.pos)) { "본문이 끊김" }
                 val end = s.pos + len
                 var id = 0L
                 while (s.pos < end) {
                     val t = s.varint()
                     when ((t and 7).toInt()) {
                         0 -> { val v = s.varint(); if (t ushr 3 == 1L) id = v }
-                        2 -> { val l = s.varint(); s.skip(l) }
+                        2 -> {
+                            val l = s.varint()
+                            require(l in 0..(end - s.pos)) { "문장이 끊김" }
+                            s.skip(l)
+                        }
                         else -> error("본문 wire type " + (t and 7))
                     }
                 }
+                require(s.pos == end) { "본문 한 줄이 제 길이를 넘음" }
                 ids.add(id)
             }
             return ids.toArray()
@@ -221,14 +297,19 @@ class LangTable(
                 when ((tag and 7).toInt()) {
                     0 -> r.varint()
                     2 -> {
-                        val len = r.varint().toInt()
-                        val end = r.p + len
+                        val len = r.varint()
+                        require(len in 0..(header.size - r.p).toLong()) { "색인이 끊김" }
+                        val end = r.p + len.toInt()
                         if (tag ushr 3 == 3L) {
                             var cid = 0L
                             while (r.p < end) {
                                 val t = r.varint()
                                 if ((t and 7).toInt() == 0) { val v = r.varint(); if (t ushr 3 == 1L) cid = v }
-                                else { val l = r.varint().toInt(); r.p += l }
+                                else {
+                                    val l = r.varint()
+                                    require(l in 0..(end - r.p).toLong()) { "색인이 끊김" }
+                                    r.p += l.toInt()
+                                }
                             }
                             cids.add(cid)
                         }
@@ -285,15 +366,46 @@ class LangTable(
 
         private fun digest16(sorted: LongArray): String {
             val md = MessageDigest.getInstance("SHA-256")
-            val buf = ByteArray(8)
+            val buf = ByteArray(8 shl 13)
+            var k = 0
             for (v in sorted) {
-                for (i in 0 until 8) buf[i] = (v ushr (8 * i)).toByte()
-                md.update(buf)
+                for (i in 0 until 8) buf[k + i] = (v ushr (8 * i)).toByte()
+                k += 8
+                if (k == buf.size) { md.update(buf); k = 0 }
             }
-            return md.digest().joinToString("") { "%02x".format(it) }.take(16)
+            md.update(buf, 0, k)
+            return hex(md.digest()).take(16)
         }
 
-        private val EMPTY = ByteArray(0)
+        /**
+         * Id 오름차순 위치. 한패 파일은 이미 오름차순이라 그대로 쓰고, 아니면(공식 원문)
+         * Id 와 위치를 long 하나에 담아 기본형 정렬한다 (Id < 2^42, 줄 < 2^21 일 때. 아니면 일반 정렬).
+         */
+        internal fun sortedOrderOf(ids: LongArray): IntArray {
+            val n = ids.size
+            var sorted = true
+            var packable = n < (1 shl 21)
+            for (i in 0 until n) {
+                if (i > 0 && ids[i] < ids[i - 1]) sorted = false
+                if (ids[i] < 0 || ids[i] >= (1L shl 42)) packable = false
+            }
+            if (sorted) return IntArray(n) { it }
+            if (!packable) return (0 until n).sortedBy { ids[it] }.toIntArray()
+            val packed = LongArray(n) { (ids[it] shl 21) or it.toLong() }
+            packed.sort()
+            return IntArray(n) { (packed[it] and 0x1FFFFFL).toInt() }
+        }
+
+        fun hex(bytes: ByteArray): String {
+            val c = CharArray(bytes.size * 2)
+            for (i in bytes.indices) {
+                val v = bytes[i].toInt() and 0xff
+                c[2 * i] = HEX[v ushr 4]; c[2 * i + 1] = HEX[v and 15]
+            }
+            return String(c)
+        }
+
+        private val HEX = "0123456789abcdef".toCharArray()
     }
 }
 
@@ -303,33 +415,45 @@ internal class Reader(private val b: ByteArray) {
         var r = 0L
         var s = 0
         while (true) {
+            if (p >= b.size) throw EOFException("파일이 중간에 끊김")
             val x = b[p++].toInt() and 0xff
             r = r or ((x and 0x7f).toLong() shl s)
             if (x < 0x80) return r
             s += 7
+            if (s > 63) throw java.io.IOException("varint 가 너무 김")
         }
     }
 }
 
-/** InputStream 위의 protobuf 읽기. 읽은 바이트 수(pos)를 센다. */
+/**
+ * InputStream 위의 protobuf 읽기. 읽은 바이트 수(pos)를 센다.
+ * 64KB 씩 직접 받아 두고 바이트 배열에서 읽는다 (InputStream.read() 를 바이트마다 부르면 몇 배 느리다).
+ */
 internal class StreamReader(private val input: InputStream) {
+    private val buf = ByteArray(1 shl 16)
+    private var p = 0
+    private var lim = 0
     var pos = 0L
         private set
 
+    private fun fill(): Boolean {
+        val n = input.read(buf, 0, buf.size)
+        if (n <= 0) return false
+        p = 0
+        lim = n
+        return true
+    }
+
     private fun byte(): Int {
-        val x = input.read()
-        if (x < 0) throw EOFException()
+        if (p == lim && !fill()) throw EOFException()
         pos++
-        return x
+        return buf[p++].toInt() and 0xff
     }
 
     fun varintOrEof(): Long? {
-        val first = input.read()
-        if (first < 0) return null
-        pos++
-        var r = (first and 0x7f).toLong()
-        if (first < 0x80) return r
-        var s = 7
+        if (p == lim && !fill()) return null
+        var r = 0L
+        var s = 0
         while (true) {
             val x = byte()
             r = r or ((x and 0x7f).toLong() shl s)
@@ -345,19 +469,72 @@ internal class StreamReader(private val input: InputStream) {
     fun skip(n: Long) {
         var left = n
         while (left > 0) {
-            val k = input.skip(left)
-            if (k > 0) { left -= k; pos += k } else { byte(); left-- }
+            if (p < lim) {
+                val k = minOf(left, (lim - p).toLong()).toInt()
+                p += k; pos += k; left -= k
+            } else {
+                val k = input.skip(left)
+                if (k > 0) { pos += k; left -= k } else if (!fill()) throw EOFException()
+            }
         }
     }
 
-    fun readFully(buf: ByteArray) {
+    fun readFully(dst: ByteArray) {
         var off = 0
-        while (off < buf.size) {
-            val k = input.read(buf, off, buf.size - off)
-            if (k < 0) throw EOFException()
-            off += k
+        while (off < dst.size) {
+            if (p == lim && !fill()) throw EOFException()
+            val k = minOf(dst.size - off, lim - p)
+            System.arraycopy(buf, p, dst, off, k)
+            p += k; off += k
         }
-        pos += buf.size
+        pos += dst.size
+    }
+}
+
+/**
+ * 64KB 블록 단위로 모아 쓰고, 해시가 있으면 블록마다 같이 갱신한다
+ * (DigestOutputStream 은 바이트마다 해시를 불러 느리다).
+ */
+private class BlockWriter(private val out: OutputStream, private val md: MessageDigest?) : java.io.Closeable {
+    private val buf = ByteArray(1 shl 16)
+    private var n = 0
+
+    private fun flushBlock() {
+        if (n == 0) return
+        out.write(buf, 0, n)
+        md?.update(buf, 0, n)
+        n = 0
+    }
+
+    fun byte(b: Int) {
+        if (n == buf.size) flushBlock()
+        buf[n++] = b.toByte()
+    }
+
+    fun varint(value: Long) {
+        var v = value
+        while (v and 0x7fL.inv() != 0L) {
+            byte(((v and 0x7f) or 0x80).toInt())
+            v = v ushr 7
+        }
+        byte(v.toInt())
+    }
+
+    fun u32le(v: Int) { byte(v); byte(v ushr 8); byte(v ushr 16); byte(v ushr 24) }
+
+    fun bytes(b: ByteArray, len: Int = b.size) {
+        var off = 0
+        while (off < len) {
+            if (n == buf.size) flushBlock()
+            val k = minOf(len - off, buf.size - n)
+            System.arraycopy(b, off, buf, n, k)
+            n += k; off += k
+        }
+    }
+
+    override fun close() {
+        flushBlock()
+        out.flush()
     }
 }
 
@@ -371,14 +548,6 @@ internal class LongArrayBuilder {
     fun toArray(): LongArray = a.copyOf(n)
 }
 
-private class CountingOutput(private val out: OutputStream) : OutputStream() {
-    var count = 0L
-        private set
-    override fun write(b: Int) { out.write(b); count++ }
-    override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len); count += len }
-    override fun flush() = out.flush()
-}
-
 internal fun OutputStream.putVarint(value: Long) {
     var v = value
     while (v and 0x7fL.inv() != 0L) {
@@ -386,10 +555,6 @@ internal fun OutputStream.putVarint(value: Long) {
         v = v ushr 7
     }
     write(v.toInt())
-}
-
-private fun OutputStream.writeU32le(v: Int) {
-    write(v and 0xff); write((v ushr 8) and 0xff); write((v ushr 16) and 0xff); write((v ushr 24) and 0xff)
 }
 
 internal fun varintSize(value: Long): Int {

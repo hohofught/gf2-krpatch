@@ -1,7 +1,9 @@
 package com.hoho.snqxkr
 
 import android.app.Application
+import android.net.ConnectivityManager
 import androidx.lifecycle.AndroidViewModel
+import com.hoho.snqxkr.langtable.Engines
 import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -33,6 +35,14 @@ data class UiState(
     val gameRunning: Boolean = false,
     /** 받아 둔 한패가 지금 게임 버전용인지. 모르면 null */
     val patchMatchesGame: Boolean? = null,
+    /** 받아 둔 한패가 이 게임 버전용인데 공식 원문과 문장 자리가 맞지 않음 (업데이트 직후 올라온 한패가 그랬던 적이 있다) */
+    val patchMisaligned: Boolean = false,
+    /** 자리 검사 결과: 번역 안 된 줄 중 원문과 같은 자리 비율 (모르면 -1) */
+    val alignRatio: Double = -1.0,
+    /** 지금 쓰는 번역 엔진 (Kotlin / 네이티브) */
+    val engineName: String = "",
+    /** 네이티브 엔진을 못 올려 Kotlin 엔진을 쓰는 이유 */
+    val engineFallback: String? = null,
     /** 지금 게임 버전으로 임시 복구본을 만들 수 있는지 */
     val canRepair: Boolean = false,
     val repairedAt: Long = 0,
@@ -41,6 +51,7 @@ data class UiState(
     val memoryAt: Long = 0,
     /** 1.0 이 남긴 원본 백업으로 번역 메모리를 준비할 수 있음 */
     val canBootstrap: Boolean = false,
+    val storage: PatchEngine.Storage = PatchEngine.Storage(0, 0, 0, 0),
     val autoCheck: Boolean = false,
     val checkIntervalHours: Int = 12,
     val allowMobileData: Boolean = false,
@@ -120,6 +131,23 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             return@launch
         }
         if (shizuku == ShizukuState.READY) inspectTarget()
+        maybePrepareMemory()
+    }
+
+    private var autoMemoryTried = false
+
+    /**
+     * 번역 메모리가 없고 1.0 원본 백업이 있으면 버튼 없이 준비한다. 게임 업데이트가 온 뒤에는 늦기 때문이다.
+     * 약 50MB 를 받으므로 Wi-Fi 이거나 모바일 데이터를 허용했을 때만. Shizuku 는 필요 없다.
+     */
+    private fun maybePrepareMemory() {
+        if (autoMemoryTried || _ui.value.busy || !engine.canBootstrap()) return
+        val cm = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
+        if (cm?.activeNetwork == null) return
+        if (cm.isActiveNetworkMetered && !repo.allowMobileData) return
+        autoMemoryTried = true
+        log("번역 메모리가 없어 자동으로 준비합니다")
+        prepareMemory()
     }
 
     /** 저장된 기록·설정을 화면 상태에 옮긴다 */
@@ -136,6 +164,9 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             memorySize = if (repo.memoryFile.isFile) repo.memorySize else 0,
             memoryAt = repo.memoryAt,
             canBootstrap = engine.canBootstrap(),
+            storage = engine.storage(),
+            engineName = engine.engineName,
+            engineFallback = Engines.fallbackReason,
             autoCheck = repo.autoCheck,
             checkIntervalHours = repo.checkIntervalHours,
             allowMobileData = repo.allowMobileData,
@@ -220,8 +251,11 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 targetTime = info.modified,
                 gameRunning = info.running,
                 privilegedUid = info.uid,
+                // 버전이 같아도 번역이 엉뚱한 자리에 들어간 한패는 "이 버전용이 아님"으로 다룬다
                 patchMatchesGame = if (info.gameLayout.isEmpty() || patchLayout.isEmpty()) null
-                else info.gameLayout == patchLayout,
+                else info.gameLayout == patchLayout && info.patchAligned != false,
+                patchMisaligned = info.gameLayout.isNotEmpty() && info.gameLayout == patchLayout && info.patchAligned == false,
+                alignRatio = info.alignRatio,
                 canRepair = engine.canRepair(pkg, info),
             ).withStored()
         }
@@ -237,8 +271,11 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         inspectTargetInternal()
     }
 
-    /** 다운로드(필요 시) 후 게임 폴더에 적용. 게임 버전과 안 맞는 한패는 넣지 않는다. */
-    fun downloadAndApply() = launchTask(busyLabel = "패치 적용 중") {
+    /**
+     * 다운로드(필요 시) 후 게임 폴더에 적용. 게임 버전과 안 맞는 한패는 넣지 않는다.
+     * force: 자리 검사에 걸린 한패를 사용자가 그래도 넣겠다고 한 경우
+     */
+    fun downloadAndApply(force: Boolean = false) = launchTask(busyLabel = "패치 적용 중") {
         val pkg = _ui.value.gamePkg ?: run { log("게임이 설치돼 있지 않습니다"); return@launchTask }
         val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return@launchTask }
 
@@ -256,7 +293,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         }
 
         _ui.update { it.copy(busyLabel = "게임 폴더에 복사 중", progress = -1f, progressText = "") }
-        val snack = when (val r = engine.apply(svc, pkg, ::log)) {
+        val snack = when (val r = engine.apply(svc, pkg, ::log, force)) {
             ApplyOutcome.Applied -> { log("적용 완료"); "한글패치 적용 완료" }
             ApplyOutcome.Same -> { log("이미 최신 한패가 적용돼 있습니다 · 복사 생략"); "이미 최신 한글패치가 적용돼 있습니다" }
             ApplyOutcome.GameRunning -> {
@@ -269,21 +306,32 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 log("한패가 아직 이 게임 버전용이 아닙니다 → 적용 중단")
                 "이 한패는 아직 새 게임 버전용이 아닙니다. 임시 복구를 쓰세요"
             }
+            is ApplyOutcome.Misaligned -> {
+                log("한패의 문장 자리가 원문과 맞지 않습니다 (${percent(r.ratio)} 일치) → 적용 중단")
+                "새 한패의 문장 자리가 원문과 맞지 않아 넣지 않았습니다. 임시 복구를 쓰거나 '그래도 적용'을 누르세요"
+            }
             is ApplyOutcome.Failed -> { log("적용 실패 · " + r.message); "적용 실패: " + r.message }
         }
         _ui.update { it.copy(snack = snack) }
         inspectTargetInternal()
     }
 
-    /** 게임 업데이트로 한패가 안 맞을 때, 번역 메모리로 새 공식 원본을 한국어화해서 넣는다 */
+    /**
+     * 게임 업데이트로 한패가 안 맞을 때, 새 공식 원본을 번역 메모리로 한국어화하고
+     * 업데이트 전에 쓰던 한패의 번역도 새 자리로 옮겨서 넣는다
+     */
     fun repair() = launchTask(busyLabel = "임시 복구 중") {
         val pkg = _ui.value.gamePkg ?: return@launchTask
         val svc = service() ?: run { log("Shizuku 연결이 필요합니다"); return@launchTask }
+        if (!repo.cacheFile.isFile) log("받아 둔 한패가 없어 번역 메모리만으로 복구합니다")
         _ui.update { it.copy(busyLabel = "새 공식 원본을 한국어로 바꾸는 중", progress = -1f) }
         val snack = when (val r = engine.repair(svc, pkg, ::log)) {
             is RepairOutcome.Done -> {
                 val pct = percent(r.coverage)
-                log("임시 복구 완료 · 한국어 $pct (${r.translated}줄), 중국어로 남음 ${r.leftChinese}줄")
+                log(
+                    "임시 복구 완료 · 한국어 $pct (${r.translated}줄" +
+                        (if (r.fromPatch > 0) ", 옛 한패에서 ${r.fromPatch}줄" else "") + "), 중국어로 남음 ${r.leftChinese}줄"
+                )
                 "임시 복구 완료 · 한국어 $pct"
             }
             RepairOutcome.GameRunning -> "게임이 실행 중입니다. 완전히 종료한 뒤 복구하세요"
@@ -334,12 +382,31 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         inspectTargetInternal()
     }
 
-    fun clearCache() = launchTask(busyLabel = "캐시 정리 중") {
-        withContext(Dispatchers.IO) { repo.cacheFile.delete() }
-        repo.cachedSha = ""
-        repo.etag = ""
-        log("다운로드 캐시를 비웠습니다")
-        _ui.update { it.copy(cacheSize = -1, cacheSha = "") }
+    /** 받은 한패·임시 복구본 삭제. 해시·버전 기록은 남겨 게임 상태 판정은 그대로다. */
+    fun clearCache() = launchTask(busyLabel = "캐시 삭제 중") {
+        val freed = engine.clearCache()
+        log("캐시 삭제 · " + human(freed))
+        _ui.update { it.copy(snack = "캐시 " + human(freed) + "를 지웠습니다") }
+    }
+
+    fun deleteMemory() = launchTask(busyLabel = "번역 메모리 삭제 중") {
+        val freed = engine.deleteMemory()
+        autoMemoryTried = true // 지운 직후 다시 받지 않는다
+        log("번역 메모리 삭제 · " + human(freed))
+        _ui.update { it.copy(snack = "번역 메모리를 지웠습니다") }
+    }
+
+    fun deleteOfficial() = launchTask(busyLabel = "공식 원본 보관본 삭제 중") {
+        val freed = engine.deleteOfficial()
+        log("공식 원본 보관본 삭제 · " + human(freed))
+        _ui.update { it.copy(snack = "공식 원본 보관본을 지웠습니다") }
+        inspectTargetInternal()
+    }
+
+    fun deleteBackups() = launchTask(busyLabel = "원본 백업 삭제 중") {
+        val freed = engine.deleteBackups()
+        log("원본 백업 삭제 · " + human(freed))
+        _ui.update { it.copy(snack = "원본 백업을 지웠습니다") }
     }
 
     private suspend fun doSync(): SyncResult {

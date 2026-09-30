@@ -43,9 +43,11 @@ import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.SportsEsports
+import androidx.compose.material.icons.rounded.Storage
 import androidx.compose.material.icons.rounded.Translate
 import androidx.compose.material.icons.rounded.Update
 import androidx.compose.material.icons.rounded.Warning
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -186,6 +188,7 @@ fun PatchScreen(vm: PatchViewModel) {
             item { PatchFileCard(ui, vm) }
             item { SettingsCard(ui, vm) }
             item { MaintenanceCard(ui, vm) }
+            item { StorageCard(ui, vm) }
             item { LogCard(ui) }
             item {
                 Text(
@@ -352,7 +355,17 @@ private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
                 Text(primary.first, style = MaterialTheme.typography.titleMedium)
             }
         }
-        if (mismatch && !ui.canRepair && ui.status != PatchStatus.REPAIRED) {
+        if (ui.patchMisaligned) {
+            Notice(
+                "새로 올라온 한패는 이 게임 버전용이지만 문장 자리가 원문과 맞지 않습니다 " +
+                    "(번역 안 된 줄 중 ${PatchViewModel.percent(ui.alignRatio.coerceAtLeast(0.0))} 일치). " +
+                    "한패 관리자가 고칠 때까지 넣지 않고 임시 복구를 씁니다."
+            )
+            TextButton(
+                onClick = { vm.downloadAndApply(force = true) },
+                enabled = !ui.busy && ui.shizuku == ShizukuState.READY,
+            ) { Text("그래도 이 한패 적용") }
+        } else if (mismatch && !ui.canRepair && ui.status != PatchStatus.REPAIRED) {
             Notice(
                 "받아 둔 한패는 이전 게임 버전용이라 넣지 않습니다. " +
                     if (ui.canBootstrap) "아래 '번역 메모리 준비'를 하면 임시 복구할 수 있습니다." else "새 한패가 나오면 알려드립니다."
@@ -589,11 +602,16 @@ private fun PatchFileCard(ui: UiState, vm: PatchViewModel) {
             InfoRow("마지막 적용", PatchViewModel.time(ui.appliedAt))
             InfoRow(
                 "게임 버전",
-                when (ui.patchMatchesGame) {
-                    true -> "받은 한패가 지금 게임 버전용입니다"
-                    false -> "받은 한패는 이전 게임 버전용입니다"
-                    null -> "확인 전"
+                when {
+                    ui.patchMisaligned -> "받은 한패는 이 버전용이지만 문장 자리가 원문과 맞지 않습니다"
+                    ui.patchMatchesGame == true -> "받은 한패가 지금 게임 버전용입니다"
+                    ui.patchMatchesGame == false -> "받은 한패는 이전 게임 버전용입니다"
+                    else -> "확인 전"
                 }
+            )
+            InfoRow(
+                "번역 엔진",
+                ui.engineName + (ui.engineFallback?.let { " · 네이티브를 못 올림: $it" } ?: "")
             )
             if (ui.status == PatchStatus.REPAIRED) {
                 InfoRow(
@@ -615,7 +633,8 @@ private fun PatchFileCard(ui: UiState, vm: PatchViewModel) {
                 }
                 Text(
                     "처음 적용할 때 백업해 둔 원본과 같은 버전의 옛 한패(약 50MB)를 GitHub 이력에서 받아 만듭니다. " +
-                        "게임 업데이트 뒤 새 한패가 나오기 전에 임시 복구할 때 씁니다.",
+                        "게임 업데이트 뒤 새 한패가 나오기 전에 임시 복구할 때 씁니다. " +
+                        "Wi-Fi 에서는 앱을 열면 자동으로 준비합니다.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -757,9 +776,6 @@ private fun MaintenanceCard(ui: UiState, vm: PatchViewModel) {
                     modifier = Modifier.weight(1f),
                 ) { Text("패치 제거") }
             }
-            TextButton(onClick = { vm.clearCache() }, enabled = !ui.busy) {
-                Text("다운로드 캐시 비우기")
-            }
             Text(
                 if (ui.hasBackup) "최초 적용 시 원본 파일을 백업해 두었습니다."
                 else "게임 폴더에 파일이 있던 경우, 최초 적용 시 자동 백업됩니다.",
@@ -767,6 +783,84 @@ private fun MaintenanceCard(ui: UiState, vm: PatchViewModel) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+/** 지우기 전에 물어보는 항목: 지우면 되돌릴 수 없는 기능이 생긴다 */
+private enum class StorageItem(val title: String, val warning: String) {
+    MEMORY(
+        "번역 메모리를 지울까요?",
+        "게임 업데이트 뒤 새 한패가 나오기 전의 임시 복구를 못 하게 됩니다. " +
+            "게임 원본과 같은 버전 한패를 다시 적용하면 새로 만들어집니다.",
+    ),
+    OFFICIAL(
+        "공식 원본 보관본을 지울까요?",
+        "지금 게임 버전으로 임시 복구하거나 번역 메모리를 새 번역으로 갱신할 때 씁니다. " +
+            "게임 파일이 원본(중국어)으로 돌아오면 다시 보관합니다.",
+    ),
+    BACKUP(
+        "원본 백업을 지울까요?",
+        "'원본 복원'을 못 하게 되고, 번역 메모리를 준비하는 데도 못 씁니다.",
+    ),
+}
+
+@Composable
+private fun StorageCard(ui: UiState, vm: PatchViewModel) {
+    var confirm by remember { mutableStateOf<StorageItem?>(null) }
+    val s = ui.storage
+    SectionCard(
+        Icons.Rounded.Storage,
+        "저장 공간",
+        trailing = { Text(PatchViewModel.human(s.total), style = MaterialTheme.typography.bodyMedium) },
+    ) {
+        Column {
+            StorageRow("캐시", "받은 한패·임시 복구본. 필요하면 다시 받거나 만듭니다", s.cache, "캐시 삭제", !ui.busy) {
+                vm.clearCache()
+            }
+            StorageRow(
+                "번역 메모리",
+                (if (ui.memorySize > 0) "%,d줄 · ".format(ui.memorySize) else "") +
+                    "최대 500MB, 넘으면 오래된 줄부터 뺍니다",
+                s.memory, "삭제", !ui.busy,
+            ) { confirm = StorageItem.MEMORY }
+            StorageRow("공식 원본 보관본", "임시 복구와 번역 메모리 갱신에 씁니다", s.official, "삭제", !ui.busy) {
+                confirm = StorageItem.OFFICIAL
+            }
+            StorageRow("원본 백업", "원본 복원에 씁니다", s.backup, "삭제", !ui.busy) { confirm = StorageItem.BACKUP }
+        }
+    }
+    confirm?.let { item ->
+        AlertDialog(
+            onDismissRequest = { confirm = null },
+            title = { Text(item.title) },
+            text = { Text(item.warning) },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirm = null
+                    when (item) {
+                        StorageItem.MEMORY -> vm.deleteMemory()
+                        StorageItem.OFFICIAL -> vm.deleteOfficial()
+                        StorageItem.BACKUP -> vm.deleteBackups()
+                    }
+                }) { Text("삭제") }
+            },
+            dismissButton = { TextButton(onClick = { confirm = null }) { Text("취소") } },
+        )
+    }
+}
+
+@Composable
+private fun StorageRow(title: String, desc: String, bytes: Long, action: String, enabled: Boolean, onClick: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(
+                title + "  " + (if (bytes > 0) PatchViewModel.human(bytes) else "없음"),
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(desc, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Spacer(Modifier.width(8.dp))
+        TextButton(onClick = onClick, enabled = enabled && bytes > 0) { Text(action) }
     }
 }
 

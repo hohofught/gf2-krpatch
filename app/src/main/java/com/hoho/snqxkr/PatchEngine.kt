@@ -1,6 +1,8 @@
 package com.hoho.snqxkr
 
 import android.content.Context
+import com.hoho.snqxkr.langtable.Engine
+import com.hoho.snqxkr.langtable.Engines
 import com.hoho.snqxkr.langtable.LangTable
 import com.hoho.snqxkr.langtable.PatchRepair
 import com.hoho.snqxkr.langtable.TranslationMemory
@@ -35,6 +37,12 @@ data class Inspection(
     val status: PatchStatus,
     /** 게임 폴더 파일의 버전 지문 (Id 집합). 모르면 "" */
     val gameLayout: String,
+    /**
+     * 받아 둔 한패가 이 게임 버전용일 때, 보관한 공식 원문과 자리가 맞는지.
+     * true 맞음, false 어긋남(업데이트 직후 올라온 한패가 그랬던 적이 있다), null 판단 못 함
+     */
+    val patchAligned: Boolean? = null,
+    val alignRatio: Double = -1.0,
 )
 
 sealed interface ApplyOutcome {
@@ -44,6 +52,8 @@ sealed interface ApplyOutcome {
     data object NoPatch : ApplyOutcome
     /** 한패가 아직 이 게임 버전용이 아님. 그대로 넣으면 문장이 엉뚱한 자리에 나온다. */
     data object VersionMismatch : ApplyOutcome
+    /** 버전은 맞는데 번역이 엉뚱한 자리에 들어간 한패. ratio = 번역 안 된 줄 중 원문과 같은 자리 비율 */
+    data class Misaligned(val ratio: Double) : ApplyOutcome
     data class Failed(val message: String) : ApplyOutcome
 }
 
@@ -57,7 +67,8 @@ sealed interface RestoreOutcome {
 }
 
 sealed interface RepairOutcome {
-    data class Done(val coverage: Double, val translated: Int, val leftChinese: Int) : RepairOutcome
+    /** fromPatch: 그중 업데이트 전에 쓰던 한패에서 옮긴 줄 */
+    data class Done(val coverage: Double, val translated: Int, val leftChinese: Int, val fromPatch: Int) : RepairOutcome
     data object GameRunning : RepairOutcome
     /** 지금 게임 버전의 공식 원본을 보관하지 못함 */
     data object NoOfficial : RepairOutcome
@@ -72,7 +83,8 @@ sealed interface RepairOutcome {
  * 업데이트 대응 흐름 (docs/lang-table-format.md):
  *  1) 게임 폴더에 공식 원본이 보이면 보관하고, 같은 버전 한패가 있으면 번역 메모리에 넣는다.
  *  2) 한패와 게임의 버전 지문이 다르면 옛 한패 적용을 막는다.
- *  3) 대신 보관한 새 공식 원본을 번역 메모리로 한국어화한 임시 복구본을 넣을 수 있다.
+ *  3) 대신 보관한 새 공식 원본을 번역 메모리로 한국어화하고, 업데이트 전에 쓰던 한패의 번역도
+ *     새 자리로 옮긴 임시 복구본을 넣을 수 있다.
  *  4) 버전이 맞는 한패가 나오면 평소처럼 적용한다.
  */
 class PatchEngine(context: Context) {
@@ -80,6 +92,11 @@ class PatchEngine(context: Context) {
     val repo = PatchRepository(context.applicationContext)
 
     private val cacheDir = context.applicationContext.cacheDir
+
+    /** 번역 엔진 (kotlin 판은 Kotlin, native 판은 C++ 를 올려 보고 안 되면 Kotlin) */
+    private val eng: Engine get() = Engines.current
+
+    val engineName: String get() = eng.name
 
     suspend fun sync(onProgress: (Long, Long) -> Unit = { _, _ -> }): SyncResult = LOCK.withLock {
         repo.sync(onProgress).also { if (it !is SyncResult.Failed) repo.remotePending = false }
@@ -90,8 +107,9 @@ class PatchEngine(context: Context) {
 
     suspend fun patchLayout(): String = LOCK.withLock { withContext(Dispatchers.IO) { patchLayoutLocked() } }
 
-    suspend fun apply(svc: IFileService, pkg: String, log: (String) -> Unit = {}): ApplyOutcome =
-        LOCK.withLock { withContext(Dispatchers.IO) { applyLocked(svc, pkg, log) } }
+    /** force: 자리 검사에 걸린 한패도 사용자가 원하면 넣는다 (번역 메모리에는 넣지 않는다) */
+    suspend fun apply(svc: IFileService, pkg: String, log: (String) -> Unit = {}, force: Boolean = false): ApplyOutcome =
+        LOCK.withLock { withContext(Dispatchers.IO) { applyLocked(svc, pkg, log, force) } }
 
     suspend fun repair(svc: IFileService, pkg: String, log: (String) -> Unit = {}): RepairOutcome =
         LOCK.withLock { withContext(Dispatchers.IO) { repairLocked(svc, pkg, log) } }
@@ -146,8 +164,35 @@ class PatchEngine(context: Context) {
             else -> svc.tableLayout(path).orEmpty()
         }.also { if (it.isNotEmpty()) repo.putLayout(sha, it) }
         t.lastStatus = status.name
-        Inspection(true, sha, size, modified, running, uid, status, layout)
+        // 받아 둔 한패가 이 게임 버전용이면 보관한 공식 원문과 자리가 맞는지 본다 (앱 폴더 파일만 써서 Shizuku 는 필요 없다)
+        val a = if (layout.isNotEmpty() && patchLayoutLocked() == layout) alignmentLocked(t, layout, log) else null
+        Inspection(true, sha, size, modified, running, uid, status, layout, a?.ok, a?.ratio ?: -1.0)
     }.onFailure { log("게임 폴더 확인 실패: " + it.message) }.getOrNull()
+
+    /**
+     * 받아 둔 한패와 이 클라이언트의 공식 원문 보관본의 자리 검사. 같은 버전 원문이 없으면 null.
+     * 50MB 두 개를 읽으므로 (한패, 원문) 짝마다 한 번만 하고 결과를 기억한다.
+     */
+    private fun alignmentLocked(t: PatchRepository.Target, layout: String, log: (String) -> Unit): PatchRepair.Alignment? {
+        if (!t.officialFile.isFile || t.officialLayout != layout || !repo.cacheFile.isFile) return null
+        alignmentKnown(t)?.let { return it }
+        val a = runCatching { eng.alignment(t.officialFile, repo.cacheFile) }
+            .onFailure { log("자리 검사 실패: " + it.message) }.getOrNull() ?: return null
+        repo.putAlignment(alignKey(t), "${a.untranslated}/${a.matching}")
+        if (a.ok == false) log("받아 둔 한패가 공식 원문과 자리가 맞지 않습니다 (번역 안 된 줄 ${a.untranslated}개 중 ${percent(a.ratio)} 일치)")
+        return a
+    }
+
+    private fun alignKey(t: PatchRepository.Target) = repo.cachedSha.take(16) + ":" + t.officialSha.take(16)
+
+    private fun alignmentKnown(t: PatchRepository.Target): PatchRepair.Alignment? {
+        val parts = repo.alignmentFor(alignKey(t))?.split('/') ?: return null
+        val u = parts.getOrNull(0)?.toIntOrNull() ?: return null
+        val m = parts.getOrNull(1)?.toIntOrNull() ?: return null
+        return PatchRepair.Alignment(u, m)
+    }
+
+    private fun percent(r: Double) = String.format(java.util.Locale.US, "%.0f%%", r * 100)
 
     /**
      * Shizuku 없이, 마지막으로 확인한 게임 폴더 파일로 상태를 다시 매긴다.
@@ -167,7 +212,10 @@ class PatchEngine(context: Context) {
             else -> PatchStatus.FOREIGN
         }
         val (size, modified) = parts[0].split(':').let { (it.getOrNull(0)?.toLongOrNull() ?: -1L) to (it.getOrNull(1)?.toLongOrNull() ?: 0L) }
-        return Inspection(true, sha, size, modified, false, -1, status, repo.layoutFor(sha).orEmpty())
+        val layout = repo.layoutFor(sha).orEmpty()
+        // 자리 검사는 기억해 둔 결과만 쓴다 (백그라운드에서 50MB 두 개를 새로 읽지 않는다)
+        val a = if (layout.isNotEmpty() && repo.layoutFor(repo.cachedSha) == layout && t.officialLayout == layout) alignmentKnown(t) else null
+        return Inspection(true, sha, size, modified, false, -1, status, layout, a?.ok, a?.ratio ?: -1.0)
     }
 
     /** 게임 폴더의 공식 원본을 앱으로 가져와 둔다. 번역 메모리를 만들고, 업데이트 후 복구할 때 쓴다. */
@@ -177,38 +225,49 @@ class PatchEngine(context: Context) {
         dst.parentFile?.mkdirs()
         svc.copyFile(path, dst.absolutePath)?.let { log("공식 원본 보관 실패: $it"); return }
         if (repo.sha256(dst) != sha) { log("공식 원본 보관 검증 실패"); return }
-        val layout = LangTable.layoutKeyOf(LangTable.readIds(dst))
+        val layout = eng.layoutKey(dst)
         t.officialSha = sha
         t.officialLayout = layout
         repo.putLayout(sha, layout)
         log("게임 공식 원본 보관 (버전 지문 ${layout.substringAfter(':').take(8)})")
         // 같은 버전 한패를 이미 받아 뒀으면 바로 번역 메모리에 넣는다
-        if (patchLayoutLocked() == layout) buildMemory(dst, repo.cacheFile, repo.cachedSha, log)
+        if (repo.cacheFile.isFile && patchLayoutLocked() == layout) buildMemory(dst, repo.cacheFile, repo.cachedSha, log)
     }
 
+    /** 받아 둔 한패의 버전 지문. 캐시를 지워도 기억해 둔 값으로 답한다. */
     private fun patchLayoutLocked(): String {
         val sha = repo.cachedSha
-        if (sha.isEmpty() || !repo.cacheFile.isFile) return ""
-        return repo.layoutFor(sha) ?: runCatching { LangTable.layoutKeyOf(LangTable.readIds(repo.cacheFile)) }
+        if (sha.isEmpty()) return ""
+        repo.layoutFor(sha)?.let { return it }
+        if (!repo.cacheFile.isFile) return ""
+        return runCatching { eng.layoutKey(repo.cacheFile) }
             .getOrDefault("").also { if (it.isNotEmpty()) repo.putLayout(sha, it) }
     }
 
-    /** 같은 버전의 공식 원본 + 한패로 번역 메모리를 만들어 기존 것과 합친다 (새 번역이 이긴다) */
-    private fun buildMemory(officialFile: File, patchFile: File, patchSha: String, log: (String) -> Unit) {
-        if (repo.memoryPatchSha == patchSha && repo.memoryFile.isFile) return
-        val fresh = TranslationMemory.build(LangTable.read(officialFile), LangTable.read(patchFile))
-        val old = if (repo.memoryFile.isFile) runCatching { TranslationMemory.read(repo.memoryFile) }.getOrNull() else null
-        val merged = old?.mergedWith(fresh) ?: fresh
+    /**
+     * 같은 버전의 공식 원본 + 한패로 번역 메모리를 만들어 기존 것과 합친다 (새 번역이 이긴다).
+     * 파일이 [TranslationMemory.MAX_BYTES] 를 넘으면 가장 오래전에 본 줄부터 뺀다.
+     * 한패가 원문과 자리가 맞지 않으면 만들지 않는다 (엉뚱한 짝이 메모리를 망가뜨린다). 만들었으면 true.
+     */
+    private fun buildMemory(officialFile: File, patchFile: File, patchSha: String, log: (String) -> Unit): Boolean {
+        if (repo.memoryPatchSha == patchSha && repo.memoryFile.isFile) return true
         val tmp = File(repo.memoryFile.path + ".tmp")
-        merged.writeTo(tmp)
+        val r = eng.buildMemory(officialFile, patchFile, repo.memoryFile, tmp, TranslationMemory.MAX_BYTES)
+        if (!r.built) {
+            tmp.delete()
+            log("한패가 공식 원문과 자리가 맞지 않아 번역 메모리에 넣지 않았습니다 (${percent(r.alignment.ratio)} 일치)")
+            return false
+        }
+        if (r.dropped > 0) log("번역 메모리가 최대 크기를 넘어 오래된 ${r.dropped}줄을 뺐습니다")
         if (!tmp.renameTo(repo.memoryFile)) {
             tmp.copyTo(repo.memoryFile, overwrite = true)
             tmp.delete()
         }
-        repo.memorySize = merged.size
+        repo.memorySize = r.size
         repo.memoryAt = System.currentTimeMillis()
         repo.memoryPatchSha = patchSha
-        log("번역 메모리 갱신 · ${merged.size}줄")
+        log("번역 메모리 갱신 · ${r.size}줄")
+        return true
     }
 
     /** 클라이언트마다 처음 한 번, 게임 폴더에 있던 파일을 백업 (원본 복원용) */
@@ -218,7 +277,7 @@ class PatchEngine(context: Context) {
         return svc.copyFile(path, t.backupFile.absolutePath)
     }
 
-    private fun applyLocked(svc: IFileService, pkg: String, log: (String) -> Unit): ApplyOutcome {
+    private fun applyLocked(svc: IFileService, pkg: String, log: (String) -> Unit, force: Boolean): ApplyOutcome {
         if (svc.isRunning(pkg)) return ApplyOutcome.GameRunning
         val src = repo.cacheFile
         val srcSha = repo.cachedSha
@@ -228,6 +287,10 @@ class PatchEngine(context: Context) {
         if (info.gameLayout.isNotEmpty() && patchLayout.isNotEmpty() && info.gameLayout != patchLayout) {
             return ApplyOutcome.VersionMismatch
         }
+        // 버전은 맞아도 번역이 엉뚱한 자리에 들어간 한패는 넣지 않는다 (같은 버전 공식 원문이 있을 때만 알 수 있다)
+        // 번역 수정판은 이 검사에 걸리지 않는다 (번역 안 된 줄의 자리만 본다). 그래도 걸리면 사용자가 force 로 넣을 수 있다
+        if (info.patchAligned == false && !force) return ApplyOutcome.Misaligned(info.alignRatio)
+        if (info.patchAligned == false) log("자리 검사에 걸린 한패를 사용자 요청으로 넣습니다")
         val t = repo.target(pkg)
         val path = Paths.targetFile(pkg)
         if (info.exists && info.sha == srcSha) {
@@ -258,10 +321,17 @@ class PatchEngine(context: Context) {
         }
         if (!repo.memoryFile.isFile) return RepairOutcome.NoMemory
 
-        val result = PatchRepair.repair(LangTable.read(t.officialFile), TranslationMemory.read(repo.memoryFile))
         val out = t.repairedFile
-        result.table.writeTo(out)
-        val sha = repo.sha256(out) ?: return RepairOutcome.Failed("복구본을 만들지 못했습니다")
+        out.parentFile?.mkdirs()
+        val result = try {
+            eng.repair(t.officialFile, repo.memoryFile, oldPatchLocked(info.gameLayout), out)
+        } catch (e: OutOfMemoryError) {
+            // 표 세 개(새 원본·메모리·옛 한패)를 한꺼번에 못 올리는 폰이면 메모리만으로 복구한다
+            log("메모리가 부족해 옛 한패 번역 옮기기를 건너뜁니다")
+            eng.repair(t.officialFile, repo.memoryFile, null, out)
+        }
+        if (result.fromPatch > 0) log("업데이트 전 한패에서 번역 ${result.fromPatch}줄을 새 자리로 옮김")
+        val sha = result.sha256 // 쓰면서 구한 해시 (다시 읽지 않는다)
 
         val path = Paths.targetFile(pkg)
         backupIfFirst(svc, path, info, t)?.let { return RepairOutcome.Failed("백업 실패: $it") }
@@ -271,8 +341,78 @@ class PatchEngine(context: Context) {
         t.repairedAt = System.currentTimeMillis()
         t.repairedCoverage = result.coverage.toFloat()
         repo.putLayout(sha, t.officialLayout)
-        return RepairOutcome.Done(result.coverage, result.translated, result.leftChinese)
+        return RepairOutcome.Done(result.coverage, result.translated, result.leftChinese, result.fromPatch)
     }
+
+    /**
+     * 임시 복구 2단계에 쓸 옛 한패: 받아 둔 한패가 게임과 다른 버전(업데이트 전 한패)이고 번역 메모리에 아직 들어가지
+     * 않은 것일 때만. 메모리가 이미 이 한패로 만들어졌으면 옮길 게 없고, 바뀐 원문에 옛 번역을 얹게 된다.
+     */
+    private fun oldPatchLocked(gameLayout: String): File? {
+        val sha = repo.cachedSha
+        if (sha.isEmpty() || !repo.cacheFile.isFile || sha == repo.memoryPatchSha) return null
+        if (patchLayoutLocked() == gameLayout) return null
+        return repo.cacheFile
+    }
+
+    /** 저장 공간 (바이트) */
+    data class Storage(
+        val cache: Long,     // 받은 한패 + 임시 복구본: 다시 받거나 만들 수 있다
+        val memory: Long,    // 번역 메모리
+        val official: Long,  // 공식 원본 보관본
+        val backup: Long,    // 원본 백업
+    ) {
+        val total: Long get() = cache + memory + official + backup
+    }
+
+    fun storage(): Storage {
+        val targets = Paths.GAME_PACKAGES.map { repo.target(it.pkg) }
+        fun size(f: File) = if (f.isFile) f.length() else 0L
+        return Storage(
+            cache = size(repo.cacheFile) + targets.sumOf { size(it.repairedFile) } + dirSize(cacheDir),
+            memory = size(repo.memoryFile),
+            official = targets.sumOf { size(it.officialFile) },
+            backup = targets.sumOf { size(it.backupFile) },
+        )
+    }
+
+    /** 받은 한패·임시 복구본을 지운다. 기록(해시·버전 지문)은 남겨 상태 판정은 그대로다. */
+    suspend fun clearCache(): Long = LOCK.withLock {
+        withContext(Dispatchers.IO) {
+            val files = listOf(repo.cacheFile) + Paths.GAME_PACKAGES.map { repo.target(it.pkg).repairedFile }
+            files.sumOf { deleteFile(it) } + (cacheDir.listFiles()?.sumOf { f -> dirSize(f).also { f.deleteRecursively() } } ?: 0L)
+        }
+    }
+
+    /** 번역 메모리를 지운다. 다음에 공식 원본과 같은 버전 한패가 모이면 다시 만든다. */
+    suspend fun deleteMemory(): Long = LOCK.withLock {
+        withContext(Dispatchers.IO) {
+            deleteFile(repo.memoryFile).also {
+                repo.memorySize = 0
+                repo.memoryAt = 0
+                repo.memoryPatchSha = ""
+            }
+        }
+    }
+
+    /** 공식 원본 보관본을 지운다. 게임 파일이 원본이면 다음 확인 때 다시 보관한다. */
+    suspend fun deleteOfficial(): Long = LOCK.withLock {
+        withContext(Dispatchers.IO) {
+            Paths.GAME_PACKAGES.sumOf { g ->
+                val t = repo.target(g.pkg)
+                deleteFile(t.officialFile).also { t.officialSha = ""; t.officialLayout = "" }
+            }
+        }
+    }
+
+    /** 원본 백업을 지운다 (원본 복원을 못 하게 된다) */
+    suspend fun deleteBackups(): Long = LOCK.withLock {
+        withContext(Dispatchers.IO) { Paths.GAME_PACKAGES.sumOf { deleteFile(repo.target(it.pkg).backupFile) } }
+    }
+
+    private fun deleteFile(f: File): Long = if (f.isFile) f.length().also { f.delete() } else 0L
+
+    private fun dirSize(f: File): Long = if (f.isFile) f.length() else f.listFiles()?.sumOf { dirSize(it) } ?: 0L
 
     /**
      * 처음 적용할 때 백업한 파일로 되돌린다. 백업은 그때 게임 버전의 파일이라,
@@ -283,7 +423,7 @@ class PatchEngine(context: Context) {
         if (!t.backupFile.isFile) return RestoreOutcome.NoBackup
         if (svc.isRunning(pkg)) return RestoreOutcome.GameRunning
         val info = inspectLocked(svc, pkg, log) ?: return RestoreOutcome.Failed("게임 폴더를 읽지 못했습니다")
-        val backupLayout = runCatching { LangTable.layoutKeyOf(LangTable.readIds(t.backupFile)) }.getOrDefault("")
+        val backupLayout = runCatching { eng.layoutKey(t.backupFile) }.getOrDefault("")
         if (info.gameLayout.isNotEmpty() && backupLayout != info.gameLayout) return RestoreOutcome.OldVersion
         svc.copyFile(t.backupFile.absolutePath, Paths.targetFile(pkg))?.let { return RestoreOutcome.Failed(it) }
         t.appliedSha = ""
@@ -304,23 +444,23 @@ class PatchEngine(context: Context) {
         if (repo.memoryFile.isFile) return true
         val official = legacyOfficial() ?: return false
         val key = LangTable.chunkKey(official)
-        val layout = LangTable.layoutKeyOf(LangTable.readIds(official))
+        val layout = eng.layoutKey(official)
 
-        // 받아 둔 한패가 마침 같은 버전이면 그걸로 끝
-        if (patchLayoutLocked() == layout) {
-            buildMemory(official, repo.cacheFile, repo.cachedSha, log)
+        // 받아 둔 한패가 마침 같은 버전이면 그걸로 끝 (자리가 맞지 않으면 이력에서 다른 것을 찾는다)
+        if (repo.cacheFile.isFile && patchLayoutLocked() == layout && buildMemory(official, repo.cacheFile, repo.cachedSha, log)) {
             return true
         }
         log("원본 백업과 같은 버전의 옛 한패를 GitHub 이력에서 찾는 중")
         val shas = runCatching { History.commitShas() }.getOrElse { log("이력 조회 실패: " + it.message); return false }
         val tmp = File(cacheDir, "history-patch.bytes")
+        // 최신 커밋부터: 같은 버전 중 자리가 맞는 가장 최근 한패 (업데이트 직후 올라온 것은 어긋나 있기도 했다)
         for (sha in shas) {
             val header = runCatching { History.header(sha) }.getOrNull() ?: continue
             if (LangTable.chunkKeyOf(header) != key) continue
             try {
                 History.download(sha, tmp)
-                if (LangTable.layoutKeyOf(LangTable.readIds(tmp)) != layout) continue
-                buildMemory(official, tmp, "history:$sha", log)
+                if (eng.layoutKey(tmp) != layout) continue
+                if (!buildMemory(official, tmp, "history:$sha", log)) continue
                 log("옛 한패(${sha.take(7)})로 번역 메모리 준비 완료")
                 return true
             } catch (t: Throwable) {

@@ -4,13 +4,21 @@
 
 ## 빌드·배포
 
+두 가지로 만든다. 둘 다 exe 한 파일이고 설치 없이 실행한다.
+
 ```
-dotnet build windows/SnqxKR.Windows.sln -c Release
+dotnet build windows/SnqxKR.Windows/SnqxKR.Windows.csproj -c Release                   # SnqxKR.exe (C# 엔진)
+native\build-windows.cmd                                                                  # snqx.dll (Visual Studio 2022 C++)
+dotnet build windows/SnqxKR.Windows/SnqxKR.Windows.csproj -c Release -p:Engine=Native   # SnqxKR-native.exe
 ```
 
-- 결과물은 `SnqxKR.Windows/bin/Release/net48/SnqxKR.exe` **한 파일(약 130KB)**. 설치 없이 실행하는 포터블 앱이다.
+- `SnqxKR.Windows/bin/Release/net48/SnqxKR.exe` (약 190KB): C# 엔진만.
+- `SnqxKR.Windows/bin/Release/native/SnqxKR-native.exe` (약 430KB): C++ 엔진 `snqx.dll`(x64, 정적 CRT)을 exe 안에 넣었다. 처음 쓸 때 `%LOCALAPPDATA%\SnqxKR\native\<내용해시>\snqx.dll` 로 풀어 올린다. 64비트가 아니거나 DLL 을 못 올리면(Smart App Control 이 서명 없는 DLL 을 막는 경우 등) C# 엔진으로 돈다. 쓰는 엔진은 화면 아래와 기록에 나온다.
+- 두 엔진의 결과는 바이트 단위로 같다. PC 에서 임시 복구 약 0.9초(C#) → 0.33초(네이티브).
 - 대상은 .NET Framework 4.8. Windows 10(1903+)·11 에 기본으로 들어 있어 런타임을 따로 깔 필요가 없다. (.NET 9 WPF 는 런타임째 넣으면 수십 MB 이고 WPF 는 트리밍이 안 된다)
-- 데이터(설정·한패 캐시·공식 원본 보관·번역 메모리)는 exe 옆 `SnqxKR-data\`. 그 폴더에 쓸 수 없으면 `%LOCALAPPDATA%\SnqxKR\`.
+- 데이터(설정·한패 캐시·공식 원본 보관·번역 메모리)는 `%LOCALAPPDATA%\SnqxKR\`. 수백 MB 가 될 수 있어 로밍(`Roaming`)이 아닌 `Local` 이다. exe 를 어디에 두든 같은 데이터를 쓴다.
+  - 0.2 가 exe 옆에 만든 `SnqxKR-data\` 는 처음 실행할 때 자동으로 옮긴다 (`settings.ini` 는 맨 마지막에 옮겨, 중간에 끊기면 다음 실행 때 마저 옮김).
+- 아이콘은 안드로이드와 같은 "한" (Noto Sans KR Bold, SIL OFL 1.1, `licenses/NotoSansKR-OFL.txt`).
 - `SnqxKR.EngineCheck` 는 엔진을 실제 파일로 검증하는 콘솔이다 (배포하지 않음). `SnqxKR.EngineCheck.exe <샘플 폴더>`.
 - Smart App Control 이 켜진 PC 에서는 서명 없는 로컬 빌드가 막힐 수 있다. 배포본은 코드 서명이 필요하다.
 
@@ -18,12 +26,18 @@ dotnet build windows/SnqxKR.Windows.sln -c Release
 
 1. **한글패치할 게임을 선택하세요**: 찾은 설치 목록. 중섭이 아닌 설치는 흐리게 보이고 선택할 수 없다. 다시 찾기 · 실행 파일 직접 선택 · 관리자 권한으로 전체 스캔.
 2. **선택한 게임**: 상태와 주 버튼(한글패치 적용 / 임시 복구 / 정식 한패로 교체), 업데이트 확인, 원본 복원, 게임 버전·한패·번역 메모리·백업 정보.
-3. **기록**
+3. **저장 공간**: 항목별 크기와 삭제, 데이터 폴더 열기.
+   - 캐시(받은 한패·임시 복구본): 다시 받거나 만들 수 있어 바로 지운다. 해시·버전 기록은 남아 상태 판정은 그대로다.
+   - 번역 메모리 · 공식 원본 보관본 · 원본 백업: 지우면 임시 복구·원본 복원을 못 하게 될 수 있어 한 번 묻는다.
+   - 번역 메모리는 최대 500MB. 넘으면 가장 오래전 한패에서만 본 줄부터 뺀다.
+4. **기록**
 
 ## 동작 (`PatchService`, 안드로이드 PatchEngine 과 같은 규칙)
 
 - 게임 폴더에 공식 원본(한글 없음)이 보이면 앱 데이터에 보관하고, 같은 버전 한패가 있으면 번역 메모리에 넣는다.
-- 한패와 게임의 버전 지문(Id 집합)이 다르면 옛 한패 적용을 막는다. 대신 보관한 공식 원본을 번역 메모리로 한국어화한 **임시 복구본**을 넣는다.
+- 한패와 게임의 버전 지문(Id 집합)이 다르면 옛 한패를 그대로 넣지 않는다 (Id 가 다시 매겨져 문장이 엉뚱한 자리에 나온다). 대신 **임시 복구본**을 넣는다.
+  1. 보관한 새 공식 원본을 번역 메모리로 한국어화한다.
+  2. 받아 둔 옛 한패가 번역 메모리보다 새것이면, 그 번역을 새 Id 자리로 옮긴다 (`docs/lang-table-format.md` 의 2단계).
 - 적용 전 설치마다 처음 한 번 게임 폴더 파일을 백업한다. **원본 복원**은 백업이 지금 게임 버전일 때만 한다.
 - 크기·수정시각이 그대로면 해시·본문 읽기를 건너뛴다.
 - 게임(`GF2_Exilium.exe`)이 그 폴더에서 실행 중이면 쓰지 않는다.

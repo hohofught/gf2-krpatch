@@ -11,6 +11,8 @@
     <AssemblyName>SnqxKR</AssemblyName>
     <Version>0.2.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
+    <!-- 안드로이드와 같은 "한" (Noto Sans KR Bold, SIL OFL 1.1) -->
+    <ApplicationIcon>app.ico</ApplicationIcon>
     <!-- 64비트 윈도우에서는 64비트로 (50MB 표 두 개를 한 번에 다룬다) -->
     <PlatformTarget>AnyCPU</PlatformTarget>
     <Prefer32Bit>false</Prefer32Bit>
@@ -30,11 +32,33 @@
   <ItemGroup>
     <ApplicationDefinition Remove="App.xaml" />
     <Page Include="App.xaml" />
+    <Resource Include="app.ico" />
   </ItemGroup>
 
   <ItemGroup>
     <Reference Include="System.Net.Http" />
     <Reference Include="Microsoft.CSharp" />
   </ItemGroup>
+
+  <!--
+    두 가지로 만든다.
+      dotnet build -c Release                 → SnqxKR.exe         (C# 엔진만)
+      dotnet build -c Release -p:Engine=Native → SnqxKR-native.exe  (C++ 엔진 snqx.dll 을 exe 안에 넣음, 못 올리면 C# 엔진)
+    네이티브 판은 먼저 native/ 를 빌드해야 한다 (native/build-windows.cmd).
+  -->
+  <PropertyGroup Condition="'$(Engine)' == 'Native'">
+    <AssemblyName>SnqxKR-native</AssemblyName>
+    <DefineConstants>$(DefineConstants);NATIVE</DefineConstants>
+    <IntermediateOutputPath>obj\$(Configuration)\native\</IntermediateOutputPath>
+    <OutputPath>bin\$(Configuration)\native\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <SnqxNativeDll>$(MSBuildThisFileDirectory)..\..\native\build\windows-x64\Release\snqx.dll</SnqxNativeDll>
+  </PropertyGroup>
+  <ItemGroup Condition="'$(Engine)' == 'Native'">
+    <EmbeddedResource Include="$(SnqxNativeDll)" LogicalName="snqx.dll" />
+  </ItemGroup>
+  <Target Name="CheckNativeDll" BeforeTargets="BeforeBuild" Condition="'$(Engine)' == 'Native'">
+    <Error Condition="!Exists('$(SnqxNativeDll)')" Text="native/build/windows-x64/Release/snqx.dll 이 없습니다. native/build-windows.cmd 를 먼저 실행하세요." />
+  </Target>
 
 </Project>
