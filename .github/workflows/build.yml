@@ -11,7 +11,31 @@ on:
 permissions:
   contents: write
 
+# 검사 순서: check(검토기, 1분) → build(단위 테스트 + APK) → smoke(에뮬레이터에서 실제로 켜 보기) → release(태그만)
+# 2.2 는 빌드만 보던 CI 를 통과하고 켜자마자 죽었다. 이제 태그 릴리스는 세 검사가 다 통과해야 올라간다.
+# 무엇을 보고 무엇을 못 보는지는 docs/review-guide.md, 손으로 올리는 릴리스 절차는 docs/release-checklist.md.
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # 바뀐 파일(엔진 짝 맞춤)과 이전 태그(versionCode 비교)를 보려면 이력이 있어야 한다
+
+      - name: Source checks (tools/review/check_source.py)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          args=()
+          if [ -n "$BASE_REF" ]; then
+            args+=(--diff "origin/$BASE_REF")
+          elif [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+            args+=(--diff "$BEFORE")
+          fi
+          if [ "$GITHUB_REF_TYPE" = tag ]; then args+=(--release-tag "$GITHUB_REF_NAME"); fi
+          python3 tools/review/check_source.py "${args[@]}"
+
   build:
     runs-on: ubuntu-latest
     env:
@@ -45,6 +69,10 @@ jobs:
           echo "$RELEASE_KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
           echo "RELEASE_KEYSTORE=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
 
+      # 실제 표 샘플이 필요한 LangTableTest 는 러너에 샘플이 없어 건너뛴다 (로컬: -PsnqxSamples=폴더)
+      - name: Unit tests
+        run: ./gradlew testKotlinDebugUnitTest --stacktrace
+
       # 두 가지: kotlin (모든 기기, 앱 코드 엔진) / native (arm64, C++ 엔진 libsnqx.so)
       - name: Build release APKs
         env:
@@ -67,9 +95,61 @@ jobs:
           name: apk
           path: out/*.apk
 
+  # 배포할 APK 그대로(R8 축소·서명까지 된 릴리스) 에뮬레이터에 깔아 켜 본다. Shizuku 흐름은 여기서 못 본다
+  smoke:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: out
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      # build 와 같은 이유로 러너의 sdkmanager 로 라이선스를 먼저 받아 둔다
+      - name: Android SDK licenses
+        run: |
+          SDKM=$(ls -d "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | sort -V | tail -1)
+          yes | "$SDKM" --licenses > /dev/null || true
+
+      # 사용자 기기와 같은 Android 16 (API 36). arm64 전용 native 판은 x86_64 에뮬레이터가 못 깔면 건너뜀으로 남는다
+      - name: Start-up smoke test (emulator)
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 36
+          target: google_apis
+          arch: x86_64
+          disable-animations: true
+          emulator-options: -no-window -gpu swiftshader_indirect -no-snapshot -noaudio -no-boot-anim -camera-back none
+          script: bash tools/smoke-android.sh --recreate --out smoke-out out/*.apk
+
+      - name: Upload smoke logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-logs
+          path: smoke-out
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, build, smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: apk
+          path: out
+
       # 손으로 올린(로컬 검증된) APK 가 이미 붙어 있으면 CI 빌드로 덮어쓰지 않는다.
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: out/*.apk
