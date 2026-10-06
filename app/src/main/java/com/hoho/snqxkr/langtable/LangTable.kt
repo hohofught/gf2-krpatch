@@ -30,6 +30,8 @@ class LangTable(
     constructor(ids: LongArray, texts: Array<ByteArray>, chunkSize: Long = 10, headerFlag: Long = 1) :
         this(ids, Texts.of(texts), chunkSize, headerFlag)
 
+    private val order: IntArray by lazy { sortedOrderOf(ids) }
+
     init {
         require(ids.size == texts.size)
     }
@@ -38,8 +40,6 @@ class LangTable(
 
     /** 게임 버전 구분용 지문 ([layoutKeyOf]) */
     fun layoutKey(): String = layoutKeyOf(ids)
-
-    private val order: IntArray by lazy { sortedOrderOf(ids) }
 
     /** Id 오름차순으로 늘어선 위치 (처음 한 번만 계산한다. 고치지 말 것) */
     fun sortedOrder(): IntArray = order

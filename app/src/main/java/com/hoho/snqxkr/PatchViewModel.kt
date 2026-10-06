@@ -90,14 +90,24 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
     fun dismissSnack() = _ui.update { it.copy(snack = null) }
 
+    // 아래 init 의 refresh() 는 첫 suspend 까지 생성자 안에서 바로 돈다. 그래서 refresh 가 읽는 필드는 모두 init 위에 둔다
+    // (init 아래에 둔 필드는 그때 아직 초기값이 들어가지 않았다. 2.2 는 diskStats 가 null 이라 켜자마자 죽었다)
+    private var migrated = false
+
+    /** 디스크를 훑어야 아는 값 (1.0 원본 백업의 한글 검사는 백업마다 최대 2MB, 캐시 폴더 크기). 메인 스레드에서 구하지 않는다 */
+    private class DiskStats(val canBootstrap: Boolean, val storage: PatchEngine.Storage)
+
+    @Volatile
+    private var diskStats = DiskStats(false, PatchEngine.Storage(0, 0, 0, 0))
+
+    private var autoMemoryTried = false
+
     init {
         // Shizuku 가 켜지거나 꺼질 때, 권한 결과가 올 때 화면을 다시 맞춘다
         viewModelScope.launch { ShizukuBridge.changes.collect { refresh() } }
         PatchCheckWorker.schedule(app, repo.autoCheck, repo.checkIntervalHours)
         refresh()
     }
-
-    private var migrated = false
 
     fun refresh() = viewModelScope.launch {
         val app = getApplication<Application>()
@@ -148,19 +158,11 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         _ui.update { it.copy(remotePending = pending) }
     }
 
-    /** 디스크를 훑어야 아는 값 (1.0 원본 백업의 한글 검사는 백업마다 최대 2MB, 캐시 폴더 크기). 메인 스레드에서 구하지 않는다 */
-    private class DiskStats(val canBootstrap: Boolean, val storage: PatchEngine.Storage)
-
-    @Volatile
-    private var diskStats = DiskStats(false, PatchEngine.Storage(0, 0, 0, 0))
-
     private suspend fun refreshDiskStats() {
         val s = withContext(Dispatchers.IO) { DiskStats(engine.canBootstrap(), engine.storage()) }
         diskStats = s
         _ui.update { it.copy(canBootstrap = s.canBootstrap, storage = s.storage) }
     }
-
-    private var autoMemoryTried = false
 
     /**
      * 번역 메모리가 없고 1.0 원본 백업이 있으면 버튼 없이 준비한다. 게임 업데이트가 온 뒤에는 늦기 때문이다.
