@@ -22,4 +22,6 @@ interface IFileService {
     int hangulCount(String path, int maxBytes) = 11;
     /** game-version fingerprint (id set) of a LangPackageTable file; null if unreadable */
     String tableLayout(String path) = 12;
+    /** "count:totalSize:latestModified" of the other *.bytes tables in dir (exclude = patch file name); null if none */
+    String tableStamp(String dir, String exclude) = 13;
 }

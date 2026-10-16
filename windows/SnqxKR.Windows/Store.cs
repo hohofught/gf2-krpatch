@@ -174,6 +174,20 @@ namespace SnqxKR
             /// <summary>"크기:수정시각|sha|한글수". 크기·수정시각이 그대로면 해시·본문 읽기를 건너뛴다.</summary>
             public string Seen { get => s.Get(k("seen")); set => s.Set(k("seen"), value); }
 
+            /// <summary>마지막으로 믿은 게임 버전 지문과 그때 표 폴더 도장 (<see cref="GameVersion"/>)</summary>
+            public GameVersion.Record GameRecord
+            {
+                get => new GameVersion.Record(s.Get(k("gameLayout")), s.Get(k("gameStamp")));
+                set
+                {
+                    s.Set(k("gameLayout"), value.Layout);
+                    s.Set(k("gameStamp"), value.Stamp);
+                }
+            }
+
+            /// <summary>게임 버전을 모른 채 이 앱이 넣은 파일의 해시. 그 파일의 지문은 게임 버전으로 믿지 않는다</summary>
+            public string BlindSha { get => s.Get(k("blindSha")); set => s.Set(k("blindSha"), value); }
+
             private string k(string name) => "t." + key + "." + name;
         }
     }

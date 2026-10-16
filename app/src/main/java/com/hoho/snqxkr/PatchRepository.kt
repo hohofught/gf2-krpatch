@@ -83,6 +83,16 @@ class PatchRepository(private val app: Context) {
 
         /** 마지막으로 확인한 게임 폴더 파일의 상태. Shizuku 가 꺼져 있을 때(무선 디버깅은 재부팅하면 꺼진다) 대신 쓴다. */
         var lastStatus: String by stringPref("lastStatus:$pkg")
+
+        /** 마지막으로 믿은 게임 버전 지문과 그때 표 폴더 도장 ([GameVersion]) */
+        var gameLayout: String by stringPref("gameLayout:$pkg")
+        var gameStamp: String by stringPref("gameStamp:$pkg")
+
+        /** 게임 버전을 모른 채 이 앱이 넣은 파일의 해시. 그 파일의 지문은 게임 버전으로 믿지 않는다 */
+        var blindSha: String by stringPref("blindSha:$pkg")
+
+        /** 마지막 확인 때 정한 게임 버전 "sha|지문". Shizuku 가 꺼져 있을 때 [PatchEngine.lastKnown] 이 쓴다 */
+        var seenGame: String by stringPref("seenGame:$pkg")
     }
 
     /** 마지막 백그라운드 확인 시각과 결과 한 줄 */

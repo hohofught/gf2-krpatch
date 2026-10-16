@@ -121,6 +121,13 @@ class FileService : IFileService.Stub() {
     override fun tableLayout(path: String): String? =
         runCatching { LangTable.layoutKeyOf(LangTable.readIds(File(path))) }.getOrNull()
 
+    /** 표 폴더 도장 (한패 파일을 뺀 표들). 게임 업데이트는 표를 한꺼번에 다시 쓰므로 이 값이 그대로면 게임 버전도 그대로다 */
+    override fun tableStamp(dir: String, exclude: String): String? = runCatching {
+        val files = File(dir).listFiles { f -> f.isFile && f.name.endsWith(".bytes") && f.name != exclude }
+        if (files.isNullOrEmpty()) null
+        else "${files.size}:${files.sumOf { it.length() }}:${files.maxOf { it.lastModified() }}"
+    }.getOrNull()
+
     override fun isRunning(pkg: String): Boolean {
         val proc = File("/proc")
         val pids = proc.list() ?: return false

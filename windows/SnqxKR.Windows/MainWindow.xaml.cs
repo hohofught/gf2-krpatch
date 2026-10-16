@@ -108,6 +108,7 @@ namespace SnqxKR
         {
             if (info == null) return "확인 전";
             if (!Directory.Exists(g.TableDir)) return "게임 데이터 없음";
+            if (info.Broken) return "한글패치 파일 손상";
             bool? match = Match(info);
             return info.Status switch
             {
@@ -115,7 +116,7 @@ namespace SnqxKR
                 PatchStatus.PatchedOld => "한패 업데이트 있음",
                 PatchStatus.Repaired => match == true ? "정식 한패 나옴" : "임시 복구 적용됨",
                 PatchStatus.Official => match == false ? "게임 업데이트로 한패가 풀림" : "한글패치 미적용",
-                PatchStatus.Foreign => match == false ? "게임 버전과 맞지 않는 한패" : "한글패치 들어 있음",
+                PatchStatus.Foreign => match == false ? "게임 버전과 맞지 않는 한패" : OtherVersion(info) ? "받아 둔 한패와 다른 판" : "한글패치 들어 있음",
                 PatchStatus.NotPatched => "한글패치 미적용",
                 _ => "확인 전",
             };
@@ -129,6 +130,10 @@ namespace SnqxKR
             info.GameLayout.Length == 0 || patchLayout.Length == 0 ? (bool?)null
             : info.GameLayout != patchLayout ? false
             : info.PatchAligned != false;
+
+        /// <summary>게임 버전은 모르는데 게임 폴더의 한패가 받아 둔 한패와 다른 판이다 (다른 판 한패를 직접 넣은 경우 등)</summary>
+        private bool OtherVersion(Inspection info) =>
+            info.GameLayout.Length == 0 && info.FileLayout.Length > 0 && patchLayout.Length > 0 && info.FileLayout != patchLayout;
 
         private async Task CheckRemoteAsync()
         {
@@ -291,6 +296,11 @@ namespace SnqxKR
             var (kind, title, body) =
                 !tableExists ? ("Neutral", "게임 데이터가 아직 없습니다", "게임을 한 번 실행해서 로그인하고 데이터를 받은 뒤 '다시 찾기'를 누르세요")
                 : info.Running ? ("Warn", "게임이 실행 중입니다", "게임을 완전히 종료한 뒤 적용하세요")
+                : info.Broken ? ("Error", "한글패치 파일이 손상됐습니다",
+                    "게임 폴더 파일을 표로 읽을 수 없습니다 (직접 고쳤거나 복사가 끊긴 파일). " +
+                    (!mismatch ? "아래 버튼으로 한글패치를 다시 넣으세요"
+                     : canRepair ? "받아 둔 한패는 이 게임 버전용이 아니라서 임시 복구로 고칠 수 있습니다"
+                     : "받아 둔 한패는 이 게임 버전용이 아닙니다. 원본 복원을 하거나 새 한패가 나오면 적용하세요"))
                 : info.Status == PatchStatus.Official && mismatch ? ("Error", "게임 업데이트로 한글패치가 풀렸습니다",
                     remotePending && canRepair ? "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 바로 넣고, 아직 아니면 임시 복구합니다"
                     : remotePending ? "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 바로 넣습니다"
@@ -306,6 +316,9 @@ namespace SnqxKR
                     t.AppliedAt > 0 ? "적용 " + Time(t.AppliedAt) : "게임 폴더 파일이 최신 한패와 같습니다")
                 : info.Status == PatchStatus.PatchedOld ? ("Warn", "한패 업데이트 있음", "적용을 누르면 최신 한패로 바꿉니다")
                 : info.Status == PatchStatus.Official ? ("Neutral", "한글패치 미적용", "한글패치가 아직 적용되지 않았습니다. 아래 버튼 한 번이면 다운로드부터 적용까지 끝납니다")
+                : info.Status == PatchStatus.Foreign && OtherVersion(info) ? ("Warn", "받아 둔 한패와 다른 판의 한글패치",
+                    "게임 폴더의 한패가 받아 둔 한패와 다른 게임 버전용입니다. 게임 버전을 확인할 수 없어 어느 쪽이 맞는지 모릅니다. " +
+                    "문장이 엉뚱하게 나오면 아래 버튼으로 받아 둔 한패를 넣으세요")
                 : info.Status == PatchStatus.Foreign && store.CachedSha.Length == 0 ? ("Info", "한글패치 들어 있음 · 확인 필요", "최신 한패인지 확인하려면 '업데이트 확인'을 누르세요")
                 : info.Status == PatchStatus.Foreign ? ("Warn", "이전 버전 한글패치", "적용을 누르면 최신 한패로 바꿉니다")
                 : ("Neutral", "한글패치 미적용", "아래 버튼 한 번이면 다운로드부터 적용까지 끝납니다");
@@ -352,9 +365,11 @@ namespace SnqxKR
                 true => "받아 둔 한패가 지금 게임 버전용입니다" + (info.PatchAligned == true ? " (원문과 자리 확인됨)" : ""),
                 false when info.PatchAligned == false => "받아 둔 한패는 이 버전용이지만 문장 자리가 원문과 맞지 않습니다",
                 false => "받아 둔 한패는 이전 게임 버전용입니다",
-                _ => store.CachedSha.Length == 0 ? "한패를 아직 받지 않았습니다" : "확인 전",
+                _ => store.CachedSha.Length == 0 ? "한패를 아직 받지 않았습니다"
+                    : info.Exists && info.GameLayout.Length == 0 ? "게임 버전을 확인할 수 없습니다 (게임이 업데이트되면 다시 확인합니다)"
+                    : "확인 전",
             });
-            if (info.Exists) Row("게임 폴더 파일", Human(info.Size) + " · " + info.Sha.Substring(0, 12) + "…");
+            if (info.Exists) Row("게임 폴더 파일", Human(info.Size) + " · " + info.Sha.Substring(0, 12) + "…" + (info.Broken ? " · 표로 읽을 수 없음" : ""));
             Row("한패 캐시", File.Exists(store.CacheFile) ? Human(new FileInfo(store.CacheFile).Length) + " · 확인 " + Time(store.CheckedAt) : "없음");
             Row("번역 메모리", File.Exists(store.MemoryFile) ? $"{store.MemorySize:N0}줄 · {Time(store.MemoryAt)}" : "없음 (공식 원본과 같은 버전 한패가 모이면 자동으로 만듭니다)");
             if (mismatch && info.Status != PatchStatus.Repaired && canRepair)
@@ -414,7 +429,8 @@ namespace SnqxKR
             await SyncAsync();
             await ReinspectAsync(g);
             if (!inspections.TryGetValue(g.GameDir, out var info)) return;
-            if (Match(info) == true)
+            // 게임 버전을 모르면(null) 적용과 같은 규칙으로 막지 않는다
+            if (Match(info) != false)
             {
                 await ApplyAsync(g);
                 return;
@@ -455,6 +471,7 @@ namespace SnqxKR
                     Outcome.NoBackup => "백업 파일이 없습니다",
                     Outcome.GameRunning => "게임이 실행 중입니다. 완전히 종료한 뒤 복원하세요",
                     Outcome.OldVersion => "백업이 이전 게임 버전의 원본이라 되돌리면 문장이 엉뚱해집니다. 복원하지 않았습니다",
+                    Outcome.UnknownVersion => "게임 버전을 확인할 수 없어 복원하지 않았습니다. 백업이 지금 게임 버전의 원본인지 알 수 없습니다",
                     _ => "복원 실패: " + r.Message,
                 });
                 await ReinspectAsync(g);

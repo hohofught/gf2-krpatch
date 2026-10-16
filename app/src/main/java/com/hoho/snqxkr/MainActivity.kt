@@ -236,6 +236,14 @@ private fun StatusHero(ui: UiState) {
             }
             HeroLook(Icons.Rounded.Security, title, body, cs.tertiaryContainer, cs.onTertiaryContainer)
         }
+        ui.targetBroken -> HeroLook(
+            Icons.Rounded.Warning, "한글패치 파일이 손상됐습니다",
+            "게임 폴더 파일을 표로 읽을 수 없습니다 (직접 고쳤거나 복사가 끊긴 파일). " +
+                if (ui.patchMatchesGame != false) "아래 버튼으로 한글패치를 다시 넣으세요"
+                else if (ui.canRepair) "받아 둔 한패는 이 게임 버전용이 아니라서 임시 복구로 고칠 수 있습니다"
+                else "받아 둔 한패는 이 게임 버전용이 아닙니다. 패치 제거로 원본을 다시 받거나 새 한패가 나오면 적용하세요",
+            cs.errorContainer, cs.onErrorContainer
+        )
         // 게임 업데이트로 한패가 풀렸고, 받아 둔 한패는 아직 옛 버전용
         ui.status == PatchStatus.OFFICIAL && ui.patchMatchesGame == false -> HeroLook(
             Icons.Rounded.Warning, "게임 업데이트로 한글패치가 풀렸습니다",
@@ -276,6 +284,12 @@ private fun StatusHero(ui: UiState) {
             Icons.Rounded.Translate, "한글패치 미적용",
             "한글패치가 아직 적용되지 않았습니다. 게임 업데이트로 원본(중국어) 파일로 덮였을 수 있습니다",
             cs.surfaceVariant, cs.onSurfaceVariant
+        )
+        ui.status == PatchStatus.FOREIGN && ui.targetOtherVersion -> HeroLook(
+            Icons.Rounded.Warning, "받아 둔 한패와 다른 판의 한글패치",
+            "게임 폴더의 한패가 받아 둔 한패와 다른 게임 버전용입니다. 게임 버전을 확인할 수 없어 어느 쪽이 맞는지 모릅니다. " +
+                "문장이 엉뚱하게 나오면 아래 버튼으로 받아 둔 한패를 넣으세요",
+            cs.tertiaryContainer, cs.onTertiaryContainer
         )
         ui.status == PatchStatus.FOREIGN && ui.cacheSha.isEmpty() -> HeroLook(
             Icons.Rounded.Update, "한글패치 적용됨 · 확인 필요",
@@ -624,6 +638,7 @@ private fun PatchFileCard(ui: UiState, vm: PatchViewModel) {
                     ui.patchMisaligned -> "받은 한패는 이 버전용이지만 문장 자리가 원문과 맞지 않습니다"
                     ui.patchMatchesGame == true -> "받은 한패가 지금 게임 버전용입니다"
                     ui.patchMatchesGame == false -> "받은 한패는 이전 게임 버전용입니다"
+                    ui.gameVersionUnknown && ui.cacheSha.isNotEmpty() -> "게임 버전을 확인할 수 없습니다 (게임이 업데이트되면 다시 확인합니다)"
                     else -> "확인 전"
                 }
             )

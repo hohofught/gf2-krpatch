@@ -42,6 +42,12 @@ data class UiState(
     val patchMisaligned: Boolean = false,
     /** 자리 검사 결과: 번역 안 된 줄 중 원문과 같은 자리 비율 (모르면 -1) */
     val alignRatio: Double = -1.0,
+    /** 게임 폴더 파일을 표로 읽을 수 없음 (직접 고쳤거나 복사가 끊긴 파일) */
+    val targetBroken: Boolean = false,
+    /** 게임 폴더에 파일은 있는데 게임 버전을 확인할 수 없음 ([GameVersion]) */
+    val gameVersionUnknown: Boolean = false,
+    /** 게임 버전은 모르는데 게임 폴더의 한패가 받아 둔 한패와 다른 판 (다른 판 한패를 직접 넣은 경우 등) */
+    val targetOtherVersion: Boolean = false,
     /** 지금 쓰는 번역 엔진 (Kotlin / 네이티브) */
     val engineName: String = "",
     /** 네이티브 엔진을 못 올려 Kotlin 엔진을 쓰는 이유 */
@@ -285,6 +291,10 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 else info.gameLayout == patchLayout && info.patchAligned != false,
                 patchMisaligned = info.gameLayout.isNotEmpty() && info.gameLayout == patchLayout && info.patchAligned == false,
                 alignRatio = info.alignRatio,
+                targetBroken = info.broken,
+                gameVersionUnknown = info.exists && info.gameLayout.isEmpty(),
+                targetOtherVersion = info.gameLayout.isEmpty() && info.fileLayout.isNotEmpty() &&
+                    patchLayout.isNotEmpty() && info.fileLayout != patchLayout,
                 canRepair = engine.canRepair(pkg, info),
             ).withStored()
         }
@@ -396,7 +406,8 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         inspectTargetInternal()
         val u = _ui.value
         when {
-            u.patchMatchesGame == true && !u.patchMisaligned -> applyNow(force = false)
+            // 게임 버전을 모르면(null) 적용과 같은 규칙으로 막지 않는다
+            u.patchMatchesGame != false && !u.patchMisaligned -> applyNow(force = false)
             u.status != PatchStatus.REPAIRED && u.canRepair -> {
                 log(if (u.patchMisaligned) "새 한패의 문장 자리가 원문과 맞지 않아 임시 복구합니다" else "새 한패도 아직 이전 게임 버전용이라 임시 복구합니다")
                 repairNow()
@@ -430,6 +441,10 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             RestoreOutcome.OldVersion -> {
                 log("백업은 이전 게임 버전의 원본이라 복원하지 않았습니다")
                 "백업이 이전 게임 버전의 원본이라 되돌리면 문장이 엉뚱해집니다. 복원하지 않았습니다"
+            }
+            RestoreOutcome.UnknownVersion -> {
+                log("게임 버전을 확인할 수 없어 원본 복원을 하지 않았습니다")
+                "게임 버전을 확인할 수 없어 복원하지 않았습니다. 패치 제거를 하면 게임이 원본을 다시 받습니다"
             }
             is RestoreOutcome.Failed -> { log("복원 실패 · " + r.message); "복원 실패: " + r.message }
         }
