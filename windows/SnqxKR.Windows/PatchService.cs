@@ -24,9 +24,10 @@ namespace SnqxKR
     /// (true 맞음, false 어긋남, null 판단 못 함 — 공식 원문이 없거나 한패가 다른 버전).
     /// GameLayout 은 지금 게임 버전(모르면 ""), FileLayout 은 게임 폴더 파일 자체의 지문 (<see cref="GameVersion"/>).
     /// Broken: 게임 폴더 파일을 표로 읽을 수 없다 (직접 고쳤거나 복사가 끊긴 파일).
+    /// FileFits: 게임 폴더 파일이 지금 게임 버전의 것인지 (false 면 문장이 엉뚱하게 나온다, 둘 중 하나라도 모르면 null).
     /// </summary>
     public sealed record Inspection(bool Exists, string Sha, long Size, PatchStatus Status, string GameLayout, bool Running,
-        bool? PatchAligned = null, double AlignRatio = -1, string FileLayout = "", bool Broken = false);
+        bool? PatchAligned = null, double AlignRatio = -1, string FileLayout = "", bool Broken = false, bool? FileFits = null);
 
     public enum Outcome { Done, Same, GameRunning, NoPatch, VersionMismatch, Misaligned, NoOfficial, NoMemory, NoBackup, OldVersion, UnknownVersion, Failed }
 
@@ -43,7 +44,7 @@ namespace SnqxKR
     ///  - 게임 폴더에 공식 원본이 보이면 보관하고, 같은 버전 한패가 있으면 번역 메모리에 넣는다
     ///  - 한패와 게임의 버전 지문(Id 집합)이 다르면 옛 한패를 그대로 넣지 않고, 임시 복구로
     ///    새 원본을 번역 메모리로 한국어화한 뒤 옛 한패의 번역을 새 자리로 옮겨 넣는다
-    ///  - 원본 복원은 백업이 지금 게임 버전일 때만 한다
+    ///  - 원본 복원은 지금 게임 버전의 원본(공식 원본 보관본, 없으면 처음 백업)으로만 한다
     ///  - 게임 버전은 게임 폴더 파일의 지문을 그대로 믿지 않고 <see cref="GameVersion"/> 규칙으로 정한다
     ///    (사용자가 다른 판 한패를 넣거나 파일을 깨뜨려도 적용·복원으로 고칠 수 있게)
     /// 중섭(CnServerCheck 통과) 설치에만 쓴다. 쓰기 권한이 없으면(Program Files 의 B服 등) 그 파일 복사만 관리자 권한으로 한다.
@@ -58,6 +59,9 @@ namespace SnqxKR
 
         /// <summary>표로 읽지 못한 게임 폴더 파일의 해시 (Gate 안에서만). 기록에 한 번만 남긴다</summary>
         private static readonly HashSet<string> Unreadable = new HashSet<string>();
+
+        /// <summary>확인하다가 번역 메모리에 넣어 본 한패의 해시 (Gate 안에서만). 실패해도 이 실행 동안 다시 하지 않는다</summary>
+        private static readonly HashSet<string> MemoryTried = new HashSet<string>();
 
         private readonly Store store;
         private readonly Action<string> log;
@@ -124,12 +128,6 @@ namespace SnqxKR
             else status = PatchStatus.Foreign;
             t.Seen = stamp + "|" + sha + "|" + (hangul ?? -2);
 
-            // 보관에 실패해도 상태 확인은 계속한다. 같은 파일로 복사를 되풀이하지 않게 이 실행 동안 기억한다 (안드로이드와 같음)
-            if (status == PatchStatus.Official && t.OfficialSha != sha && !CaptureFailed.Contains(sha))
-            {
-                try { CaptureOfficial(g, path, sha); }
-                catch (Exception e) { CaptureFailed.Add(sha); log("공식 원본 보관 실패: " + e.Message); }
-            }
             // 이 파일 자체의 지문. 표로 읽을 수 없으면 "" (예외로 끝내면 화면에서 이 설치가 사라져 고칠 버튼도 없어진다)
             var fileLayout = store.LayoutFor(sha);
             if (fileLayout == null)
@@ -146,9 +144,57 @@ namespace SnqxKR
             if (broken && status == PatchStatus.Official) status = PatchStatus.Foreign; // 한글이 없어도 표가 아니면 공식 원본이 아니다
             bool ours = status == PatchStatus.PatchedLatest || status == PatchStatus.PatchedOld || status == PatchStatus.Repaired;
             var layout = GameLayoutFor(t, status == PatchStatus.Official, ours && sha != t.BlindSha, fileLayout, tables);
+            // 게임 버전과 다른 원본은 게임이 쓴 것이 아니다 (사용자가 넣은 옛 원본). 공식 원본으로 보관·백업하지 않는다
+            if (status == PatchStatus.Official && layout != fileLayout) status = PatchStatus.Foreign;
+
+            // 보관에 실패해도 상태 확인은 계속한다. 같은 파일로 복사를 되풀이하지 않게 이 실행 동안 기억한다 (안드로이드와 같음)
+            if (status == PatchStatus.Official && t.OfficialSha != sha && !CaptureFailed.Contains(sha))
+            {
+                try { CaptureOfficial(g, path, sha); }
+                catch (Exception e) { CaptureFailed.Add(sha); log("공식 원본 보관 실패: " + e.Message); }
+            }
             // 받아 둔 한패가 이 게임 버전용이면 보관한 공식 원문과 자리가 맞는지 본다 (업데이트 직후 올라온 한패가 깨져 있던 적이 있다)
             var a = layout.Length > 0 && PatchLayout() == layout ? AlignmentWith(t, layout) : null;
-            return new Inspection(true, sha, fi.Length, status, layout, running, a?.Ok, a?.Ratio ?? -1, fileLayout, broken);
+            // 같은 버전 공식 원문과 자리가 맞는 한패가 다 있으면 게임 폴더에 넣지 않았어도 번역 메모리에 넣는다
+            // (원본을 보관한 뒤에 받은 한패를 사용자가 직접 넣으면 적용을 거치지 않아 메모리가 옛 번역에 머물렀다). 한패마다 한 번
+            if (a?.Ok == true && store.MemoryPatchSha != store.CachedSha && MemoryTried.Add(store.CachedSha))
+            {
+                try
+                {
+                    if (PatchSource.Sha256(store.CacheFile) == store.CachedSha) BuildMemory(t.OfficialFile, store.CacheFile, store.CachedSha);
+                }
+                catch (Exception e) { log("번역 메모리 갱신 실패: " + e.Message); }
+            }
+            bool? fits = layout.Length > 0 && fileLayout.Length > 0 ? fileLayout == layout : (bool?)null;
+            // Id 는 1001 부터 줄 번호처럼 이어져서 지문은 사실상 줄 수다. 게임이 줄 수를 그대로 둔 채 업데이트하면(10-21 긴급 패치)
+            // 이전 판 한패도 지문이 같지만 문장이 전부 어긋난다. 그래서 한글 파일은 보관한 이 버전 공식 원문과 자리까지 견준다
+            if (fits == true && status != PatchStatus.Official)
+            {
+                var fa = sha == store.CachedSha ? a : FileAlignment(t, layout, path, sha);
+                if (fa?.Ok == false) fits = false;
+            }
+            return new Inspection(true, sha, fi.Length, status, layout, running, a?.Ok, a?.Ratio ?? -1, fileLayout, broken, fits);
+        }
+
+        /// <summary>게임 폴더 파일과 이 버전 공식 원문 보관본의 자리 검사 (파일·원문 짝마다 한 번, 받아 둔 한패와 같은 기록). 못 하면 null</summary>
+        private PatchRepair.Alignment? FileAlignment(Store.Target t, string layout, string path, string sha)
+        {
+            if (!File.Exists(t.OfficialFile) || t.OfficialLayout != layout) return null;
+            var key = "align." + Head(sha) + "." + Head(t.OfficialSha);
+            var known = store.Get(key).Split('/');
+            if (known.Length == 2 && int.TryParse(known[0], out var u) && int.TryParse(known[1], out var m))
+                return new PatchRepair.Alignment(u, m);
+            try
+            {
+                var a = engine.Alignment(t.OfficialFile, path);
+                store.Set(key, a.Untranslated + "/" + a.Matching);
+                if (a.Ok == false) log($"게임 폴더 한패가 지금 게임 원문과 자리가 맞지 않습니다 (번역 안 된 줄 {a.Untranslated:N0}개 중 {a.Ratio:P0} 일치)");
+                return a;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
 
         /// <summary>지금 게임 버전 (<see cref="GameVersion"/>). 새로 믿게 된 지문은 기억해 둔다</summary>
@@ -342,31 +388,32 @@ namespace SnqxKR
             if (info.PatchAligned == false && !force) return new ActionResult(Outcome.Misaligned, "", info.AlignRatio);
             if (info.PatchAligned == false) log("자리 검사에 걸린 한패를 사용자 요청으로 넣습니다");
             var t = store.For(g.GameDir);
-            if (info.Exists && info.Sha == store.CachedSha)
-            {
-                t.AppliedSha = store.CachedSha;
-                t.RepairedSha = "";
-                return new ActionResult(Outcome.Same);
-            }
+            // 게임 폴더에 이미 같은 파일이 있으면(직접 넣은 경우 포함) 복사만 건너뛰고 기록·번역 메모리는 똑같이 갱신한다
+            bool same = info.Exists && info.Sha == store.CachedSha;
             // 받은 뒤 캐시 파일이 바뀌었으면(직접 고친 경우 등) 넣지 않는다. 넣은 뒤에 알면 그 파일이 게임 폴더에 남는다.
             // 온라인이면 받기 단계에서 다시 받으므로 여기 걸리는 것은 오프라인일 때뿐이다
-            if (PatchSource.Sha256(store.CacheFile) != store.CachedSha)
-                return new ActionResult(Outcome.Failed, "받아 둔 한패 파일이 받은 뒤 바뀌었습니다. 인터넷에 연결해 업데이트 확인으로 다시 받으세요");
-            var err = BackupIfFirst(t, g.TargetFile, info) ?? WriteGameFile(store.CacheFile, g.TargetFile);
-            if (err != null) return new ActionResult(Outcome.Failed, err);
-            if (PatchSource.Sha256(g.TargetFile) != store.CachedSha) return new ActionResult(Outcome.Failed, "복사 후 해시가 다릅니다");
+            bool intact = PatchSource.Sha256(store.CacheFile) == store.CachedSha;
+            if (!same)
+            {
+                if (!intact)
+                    return new ActionResult(Outcome.Failed, "받아 둔 한패 파일이 받은 뒤 바뀌었습니다. 인터넷에 연결해 업데이트 확인으로 다시 받으세요");
+                var err = BackupIfFirst(t, g.TargetFile, info) ?? WriteGameFile(store.CacheFile, g.TargetFile);
+                if (err != null) return new ActionResult(Outcome.Failed, err);
+                if (PatchSource.Sha256(g.TargetFile) != store.CachedSha) return new ActionResult(Outcome.Failed, "복사 후 해시가 다릅니다");
+            }
+            // 적용 시각은 이 앱이 그 파일을 넣거나(직접 넣은 파일이면) 처음 확인한 때. 같은 파일을 다시 눌러도 바꾸지 않는다
+            if (!same || t.AppliedSha != store.CachedSha) t.AppliedAt = PatchSource.Now();
             t.AppliedSha = store.CachedSha;
-            t.AppliedAt = PatchSource.Now();
             t.RepairedSha = "";
             // 게임 버전을 모른 채 넣었으면 이 파일의 지문을 게임 버전으로 믿지 않는다 (다음 공식 원본을 볼 때까지 모름)
             t.BlindSha = info.GameLayout.Length == 0 ? store.CachedSha : "";
             // 이 버전 공식 원본을 보관해 뒀으면 번역 메모리를 최신 번역으로 갱신
-            if (File.Exists(t.OfficialFile) && t.OfficialLayout == patchLayout)
+            if (intact && File.Exists(t.OfficialFile) && t.OfficialLayout == patchLayout)
             {
                 try { BuildMemory(t.OfficialFile, store.CacheFile, store.CachedSha); }
                 catch (Exception e) { log("번역 메모리 갱신 실패: " + e.Message); }
             }
-            return new ActionResult(Outcome.Done);
+            return new ActionResult(same ? Outcome.Same : Outcome.Done);
         }
 
         private ActionResult Repair(GameInstall g)
@@ -408,13 +455,15 @@ namespace SnqxKR
         /// <summary>
         /// 임시 복구 2단계에 쓸 옛 한패 경로: 받아 둔 한패가 게임과 다른 버전(업데이트 전 한패)이고
         /// 번역 메모리에 아직 들어가지 않은 것일 때만. 메모리가 이미 이 한패로 만들어졌으면 옮길 게 없고,
-        /// 바뀐 원문에 옛 번역을 얹게 된다. 같은 버전인데 자리가 어긋난 한패는 쓰지 않는다.
+        /// 바뀐 원문에 옛 번역을 얹게 된다.
+        /// 지문이 같아도 자리가 어긋난 한패는 쓴다: 지문은 사실상 줄 수라서, 줄 수만 같은 이전 업데이트의 한패다
+        /// (실측 10-21: 10-20 한패를 옮기면 정식 한패와 같은 줄 91.9% → 92.9%). 자리가 맞거나 모르면 쓰지 않는다.
         /// </summary>
         private string? OldPatch(Inspection info)
         {
             var sha = store.CachedSha;
             if (sha.Length == 0 || !File.Exists(store.CacheFile) || sha == store.MemoryPatchSha) return null;
-            if (PatchLayout() == info.GameLayout) return null;
+            if (PatchLayout() == info.GameLayout && info.PatchAligned != false) return null;
             return store.CacheFile;
         }
 
@@ -463,24 +512,45 @@ namespace SnqxKR
             return size;
         }
 
+        /// <summary>원본 복원에 쓸 파일이 하나라도 있는지 (지금 버전용인지는 복원할 때 본다)</summary>
+        public bool HasOriginal(GameInstall g)
+        {
+            var t = store.For(g.GameDir);
+            return File.Exists(t.OfficialFile) || File.Exists(t.BackupFile);
+        }
+
         /// <summary>
-        /// 처음 적용할 때 백업한 파일로 되돌린다. 백업이 이전 게임 버전이면 되돌리지 않는다 (문장이 엉뚱해진다).
+        /// 공식 원본(중국어)으로 되돌린다. 지금 게임 버전의 공식 원본 보관본이 있으면 그것을, 없으면 처음 적용할 때 백업한 파일을 쓴다
+        /// (둘 다 게임이 쓴 원본이다. 게임이 업데이트되면 처음 백업은 옛 버전이 되지만 보관본은 새 버전으로 바뀐다).
+        /// 지금 게임 버전과 다른 원본은 넣지 않는다 (문장이 엉뚱해진다).
         /// 게임 버전을 모르면 되돌리지 않는다: 게임 폴더에 다른 판 한패가 들어 있을 때 그 지문과 비교하면 옛 원본이 새 게임에
         /// 들어가고, 그 옛 원본이 이 버전의 공식 원본으로 보관돼 버린다.
         /// </summary>
         private ActionResult Restore(GameInstall g)
         {
             var t = store.For(g.GameDir);
-            if (!File.Exists(t.BackupFile)) return new ActionResult(Outcome.NoBackup);
+            if (!HasOriginal(g)) return new ActionResult(Outcome.NoBackup);
             if (GameLocator.IsGameRunningAt(g.GameDir)) return new ActionResult(Outcome.GameRunning);
             var info = Inspect(g);
             if (info.GameLayout.Length == 0) return new ActionResult(Outcome.UnknownVersion);
-            string backupLayout;
-            try { backupLayout = engine.LayoutKey(t.BackupFile); }
-            catch (Exception e) { return new ActionResult(Outcome.Failed, "원본 백업을 읽을 수 없습니다: " + e.Message); }
-            if (backupLayout != info.GameLayout) return new ActionResult(Outcome.OldVersion);
-            var err = WriteGameFile(t.BackupFile, g.TargetFile);
+            string? source = null, sha = null;
+            if (File.Exists(t.OfficialFile) && t.OfficialLayout == info.GameLayout)
+            {
+                // 보관한 뒤 바뀐 파일(직접 고친 경우 등)은 쓰지 않는다
+                var s = PatchSource.Sha256(t.OfficialFile);
+                if (s == t.OfficialSha) (source, sha) = (t.OfficialFile, s);
+            }
+            if (source == null && File.Exists(t.BackupFile))
+            {
+                string backupLayout;
+                try { backupLayout = engine.LayoutKey(t.BackupFile); }
+                catch (Exception e) { return new ActionResult(Outcome.Failed, "원본 백업을 읽을 수 없습니다: " + e.Message); }
+                if (backupLayout == info.GameLayout) (source, sha) = (t.BackupFile, PatchSource.Sha256(t.BackupFile));
+            }
+            if (source == null || sha == null) return new ActionResult(Outcome.OldVersion);
+            var err = WriteGameFile(source, g.TargetFile);
             if (err != null) return new ActionResult(Outcome.Failed, err);
+            if (PatchSource.Sha256(g.TargetFile) != sha) return new ActionResult(Outcome.Failed, "복사 후 해시가 다릅니다");
             t.AppliedSha = "";
             t.RepairedSha = "";
             t.BlindSha = "";

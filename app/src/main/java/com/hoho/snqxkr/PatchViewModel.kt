@@ -34,7 +34,11 @@ data class UiState(
     val patchReceivedAt: Long = 0,
     val checkedAt: Long = 0,
     val appliedAt: Long = 0,
+    /** 게임 폴더 파일이 이 앱이 넣은 그 한패인지 (직접 넣은 파일에 예전 적용 시각을 보이지 않는다) */
+    val appliedHere: Boolean = false,
     val hasBackup: Boolean = false,
+    /** 원본 복원에 쓸 파일(지금 버전 공식 원본 보관본 또는 처음 백업)이 있는지 */
+    val hasOriginal: Boolean = false,
     val gameRunning: Boolean = false,
     /** 받아 둔 한패가 지금 게임 버전용인지. 모르면 null */
     val patchMatchesGame: Boolean? = null,
@@ -48,6 +52,8 @@ data class UiState(
     val gameVersionUnknown: Boolean = false,
     /** 게임 버전은 모르는데 게임 폴더의 한패가 받아 둔 한패와 다른 판 (다른 판 한패를 직접 넣은 경우 등) */
     val targetOtherVersion: Boolean = false,
+    /** 게임 폴더 파일이 지금 게임 버전의 것인지 (false: 옛 한패·옛 원본·줄 수만 같은 한패라 문장이 엉뚱하다, 모르면 null) */
+    val targetFits: Boolean? = null,
     /** 지금 쓰는 번역 엔진 (Kotlin / 네이티브) */
     val engineName: String = "",
     /** 네이티브 엔진을 못 올려 Kotlin 엔진을 쓰는 이유 */
@@ -77,7 +83,16 @@ data class UiState(
     val progressText: String = "",
     val log: List<String> = emptyList(),
     val snack: String? = null,
-)
+) {
+    /**
+     * 게임 폴더에 지금 게임 버전에 맞는 한글 파일(받아 둔 것과 다른 한패, 이전에 넣은 한패)이 들어 있는데 받아 둔 한패는 맞지 않는다.
+     * 이 파일을 그대로 둔다: 임시 복구로 바꾸면 오히려 나빠진다 (임시 복구본과 같게 다룬다, 윈도우 Keeps 와 같다).
+     * 받아 둔 한패가 아직 다음 게임 버전용일 때(서버가 게임보다 먼저 올라옴) 이렇게 된다.
+     */
+    val keepsTarget: Boolean
+        get() = patchMatchesGame == false && targetFits == true && !targetBroken &&
+            (status == PatchStatus.FOREIGN || status == PatchStatus.PATCHED_OLD)
+}
 
 class PatchViewModel(app: Application) : AndroidViewModel(app) {
 
@@ -193,7 +208,9 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             patchReceivedAt = if (repo.cacheFile.isFile) repo.cacheFile.lastModified() else 0L,
             checkedAt = repo.checkedAt,
             appliedAt = t?.appliedAt ?: 0L,
+            appliedHere = t != null && targetSha.isNotEmpty() && t.appliedSha == targetSha,
             hasBackup = t?.backupFile?.isFile == true,
+            hasOriginal = gamePkg?.let { engine.hasOriginal(it) } == true,
             repairedAt = t?.repairedAt ?: 0L,
             repairedCoverage = t?.repairedCoverage ?: -1f,
             memorySize = if (repo.memoryFile.isFile) repo.memorySize else 0,
@@ -295,6 +312,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
                 gameVersionUnknown = info.exists && info.gameLayout.isEmpty(),
                 targetOtherVersion = info.gameLayout.isEmpty() && info.fileLayout.isNotEmpty() &&
                     patchLayout.isNotEmpty() && info.fileLayout != patchLayout,
+                targetFits = info.fileFits,
                 canRepair = engine.canRepair(pkg, info),
             ).withStored()
         }
@@ -356,7 +374,7 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
             }
             is ApplyOutcome.Misaligned -> {
                 log("한패의 문장 자리가 원문과 맞지 않습니다 (${percent(r.ratio)} 일치) → 적용 중단")
-                "새 한패의 문장 자리가 원문과 맞지 않아 넣지 않았습니다. 임시 복구를 쓰거나 '그래도 적용'을 누르세요"
+                "받아 둔 한패의 문장 자리가 지금 게임 원문과 맞지 않아 넣지 않았습니다. 임시 복구를 쓰거나 '그래도 적용'을 누르세요"
             }
             is ApplyOutcome.Failed -> { log("적용 실패 · " + r.message); "적용 실패: " + r.message }
         }
@@ -408,16 +426,18 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         when {
             // 게임 버전을 모르면(null) 적용과 같은 규칙으로 막지 않는다
             u.patchMatchesGame != false && !u.patchMisaligned -> applyNow(force = false)
-            u.status != PatchStatus.REPAIRED && u.canRepair -> {
-                log(if (u.patchMisaligned) "새 한패의 문장 자리가 원문과 맞지 않아 임시 복구합니다" else "새 한패도 아직 이전 게임 버전용이라 임시 복구합니다")
+            // 이 버전에 맞는 한글 파일이 이미 있으면 임시 복구로 덮지 않는다 (큰 버튼과 같은 규칙)
+            u.status != PatchStatus.REPAIRED && !u.keepsTarget && u.canRepair -> {
+                log(if (u.patchMisaligned) "새 한패의 문장 자리가 원문과 맞지 않아 임시 복구합니다" else "새 한패도 아직 이 게임 버전용이 아니라 임시 복구합니다")
                 repairNow()
             }
             else -> _ui.update {
                 it.copy(
                     snack = when {
                         u.patchMisaligned -> "새 한패의 문장 자리가 원문과 맞지 않아 넣지 않았습니다"
-                        u.status == PatchStatus.REPAIRED -> "새 한패도 아직 이전 게임 버전용입니다. 임시 복구를 그대로 씁니다"
-                        else -> "새 한패도 아직 이전 게임 버전용입니다. 새 한패를 기다리세요"
+                        u.status == PatchStatus.REPAIRED -> "새 한패도 아직 이 게임 버전용이 아닙니다. 임시 복구를 그대로 씁니다"
+                        u.keepsTarget -> "새 한패는 아직 이 게임 버전용이 아닙니다. 지금 한패를 그대로 씁니다"
+                        else -> "새 한패도 아직 이 게임 버전용이 아닙니다. 새 한패를 기다리세요"
                     }
                 )
             }
@@ -436,11 +456,11 @@ class PatchViewModel(app: Application) : AndroidViewModel(app) {
         val svc = service() ?: return@launchTask
         val snack = when (val r = engine.restoreBackup(svc, pkg, ::log)) {
             RestoreOutcome.Restored -> { log("원본 복원 완료"); "원본 파일로 되돌렸습니다" }
-            RestoreOutcome.NoBackup -> "백업 파일이 없습니다"
+            RestoreOutcome.NoBackup -> "되돌릴 원본 파일이 없습니다"
             RestoreOutcome.GameRunning -> "게임이 실행 중입니다. 완전히 종료한 뒤 복원하세요"
             RestoreOutcome.OldVersion -> {
-                log("백업은 이전 게임 버전의 원본이라 복원하지 않았습니다")
-                "백업이 이전 게임 버전의 원본이라 되돌리면 문장이 엉뚱해집니다. 복원하지 않았습니다"
+                log("가진 원본이 모두 이전 게임 버전의 것이라 복원하지 않았습니다")
+                "가진 원본이 모두 이전 게임 버전의 것이라 되돌리면 문장이 엉뚱해집니다. 패치 제거를 하면 게임이 원본을 다시 받습니다"
             }
             RestoreOutcome.UnknownVersion -> {
                 log("게임 버전을 확인할 수 없어 원본 복원을 하지 않았습니다")

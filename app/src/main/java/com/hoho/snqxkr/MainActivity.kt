@@ -214,6 +214,16 @@ private data class HeroLook(
     val onContainer: Color,
 )
 
+/** 게임 폴더 파일이 깨졌거나 다른 게임 버전의 것일 때 고칠 길 (윈도우와 같은 순서) */
+private fun fixHint(ui: UiState): String = when {
+    ui.patchMatchesGame != false ->
+        if (ui.cacheSha.isNotEmpty()) "아래 버튼으로 받아 둔 한패를 넣으세요" else "아래 버튼으로 한글패치를 받아 넣으세요"
+    ui.canRepair -> "받아 둔 한패는 이 게임 버전용이 아니라서 임시 복구로 고칠 수 있습니다"
+    ui.remotePending -> "서버에 새 한패가 올라왔습니다. 받아서 이 게임 버전용이면 넣습니다"
+    ui.hasOriginal -> "받아 둔 한패는 이 게임 버전용이 아닙니다. 원본 복원으로 되돌리거나 새 한패가 나오면 적용하세요"
+    else -> "받아 둔 한패는 이 게임 버전용이 아닙니다. 패치 제거로 원본을 다시 받거나 새 한패가 나오면 적용하세요"
+}
+
 @Composable
 private fun StatusHero(ui: UiState) {
     val cs = MaterialTheme.colorScheme
@@ -238,10 +248,13 @@ private fun StatusHero(ui: UiState) {
         }
         ui.targetBroken -> HeroLook(
             Icons.Rounded.Warning, "한글패치 파일이 손상됐습니다",
-            "게임 폴더 파일을 표로 읽을 수 없습니다 (직접 고쳤거나 복사가 끊긴 파일). " +
-                if (ui.patchMatchesGame != false) "아래 버튼으로 한글패치를 다시 넣으세요"
-                else if (ui.canRepair) "받아 둔 한패는 이 게임 버전용이 아니라서 임시 복구로 고칠 수 있습니다"
-                else "받아 둔 한패는 이 게임 버전용이 아닙니다. 패치 제거로 원본을 다시 받거나 새 한패가 나오면 적용하세요",
+            "게임 폴더 파일을 표로 읽을 수 없습니다 (직접 고쳤거나 복사가 끊긴 파일). " + fixHint(ui),
+            cs.errorContainer, cs.onErrorContainer
+        )
+        // 옛 한패·옛 원본, 또는 줄 수만 같은 다른 업데이트의 한패 (윈도우와 같다)
+        ui.targetFits == false -> HeroLook(
+            Icons.Rounded.Warning, "게임 버전과 맞지 않는 파일",
+            "게임 폴더에 다른 게임 버전의 한패나 원본이 들어 있어 문장이 엉뚱하게 나옵니다. " + fixHint(ui),
             cs.errorContainer, cs.onErrorContainer
         )
         // 게임 업데이트로 한패가 풀렸고, 받아 둔 한패는 아직 옛 버전용
@@ -264,17 +277,24 @@ private fun StatusHero(ui: UiState) {
                 else "정식 한패를 기다리는 중 · 확인 " + PatchViewModel.time(ui.checkedAt),
             cs.secondaryContainer, cs.onSecondaryContainer
         )
-        ui.status == PatchStatus.FOREIGN && ui.patchMatchesGame == false -> HeroLook(
-            Icons.Rounded.Warning, "게임 버전과 맞지 않는 한글패치",
-            "게임 업데이트 전 한패가 들어 있어 문장이 엉뚱하게 나올 수 있습니다. 게임 버전에 맞는 한패가 나오면 적용하세요",
-            cs.errorContainer, cs.onErrorContainer
+        ui.keepsTarget -> HeroLook(
+            Icons.Rounded.CheckCircle, "게임 버전에 맞는 한글패치가 들어 있습니다",
+            when {
+                ui.patchMisaligned -> "새로 받은 한패는 문장 자리가 원문과 맞지 않아 넣지 않았습니다. 지금 파일을 그대로 둡니다"
+                ui.status == PatchStatus.PATCHED_OLD -> "새로 받은 한패는 아직 이 게임 버전용이 아니라 넣지 않았습니다. 게임이 업데이트되면 넣을 수 있습니다"
+                else -> "받아 둔 한패는 이 게임 버전용이 아니라 지금 파일을 그대로 둡니다"
+            } + if (ui.remotePending) ". 서버에 새 한패가 올라왔습니다" else "",
+            cs.primaryContainer, cs.onPrimaryContainer
         )
         ui.status == PatchStatus.PATCHED_LATEST -> HeroLook(
             Icons.Rounded.CheckCircle, "최신 한글패치 적용됨",
-            // 다른 앱(1.0 등)이나 손으로 넣은 경우엔 이 앱의 적용 기록이 없다
-            (if (ui.appliedAt > 0) "적용 " + PatchViewModel.time(ui.appliedAt) + " · " else "게임 폴더 파일이 최신 한패와 같습니다 · ") +
-                "확인 " + PatchViewModel.time(ui.checkedAt),
-            cs.primaryContainer, cs.onPrimaryContainer
+            // 적용 시각은 이 앱이 그 파일을 넣었을 때만 (다른 앱(1.0 등)이나 손으로 넣은 파일에 예전 적용 시각을 보이지 않는다)
+            (if (ui.appliedHere && ui.appliedAt > 0) "적용 " + PatchViewModel.time(ui.appliedAt) + " · "
+            else "게임 폴더 파일이 최신 한패와 같습니다 (이 앱으로 넣지 않은 파일) · ") +
+                (if (ui.gameVersionUnknown) "게임 버전을 확인하지 못해 이 한패가 지금 게임용인지 모릅니다"
+                else "확인 " + PatchViewModel.time(ui.checkedAt)),
+            if (ui.gameVersionUnknown) cs.secondaryContainer else cs.primaryContainer,
+            if (ui.gameVersionUnknown) cs.onSecondaryContainer else cs.onPrimaryContainer,
         )
         ui.status == PatchStatus.PATCHED_OLD -> HeroLook(
             Icons.Rounded.Update, "업데이트 있음",
@@ -297,8 +317,8 @@ private fun StatusHero(ui: UiState) {
             cs.secondaryContainer, cs.onSecondaryContainer
         )
         ui.status == PatchStatus.FOREIGN -> HeroLook(
-            Icons.Rounded.Warning, "이전 버전 한글패치",
-            "최신이 아닌 한글패치가 들어 있습니다. 적용을 누르면 최신 한패로 바꿉니다",
+            Icons.Rounded.Warning, "받아 둔 한패와 다른 한글패치",
+            "받아 둔 최신 한패와 다른 한글패치가 들어 있습니다. 적용을 누르면 받아 둔 최신 한패로 바꿉니다",
             cs.tertiaryContainer, cs.onTertiaryContainer
         )
         ui.status == PatchStatus.NOT_PATCHED -> HeroLook(
@@ -354,10 +374,11 @@ private fun StatusHero(ui: UiState) {
 
 @Composable
 private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
-    // 큰 버튼: 지금 할 가장 좋은 일 하나 (PrimaryAction, 윈도우와 같은 규칙)
+    // 큰 버튼: 지금 할 가장 좋은 일 하나 (PrimaryAction, 윈도우와 같은 규칙).
+    // 이 게임 버전에 맞는 한글 파일이 이미 있으면 임시 복구본과 같게 다룬다 (임시 복구로 덮지 않는다)
     val mismatch = ui.patchMatchesGame == false
     val action = PrimaryAction.decide(
-        gameReady = true, repaired = ui.status == PatchStatus.REPAIRED, matches = ui.patchMatchesGame,
+        gameReady = true, repaired = ui.status == PatchStatus.REPAIRED || ui.keepsTarget, matches = ui.patchMatchesGame,
         canRepair = ui.canRepair, remotePending = ui.remotePending,
     )
     val primary: Triple<String, ImageVector, () -> Unit>? = action?.let { a ->
@@ -383,9 +404,10 @@ private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
         }
         if (ui.patchMisaligned) {
             Notice(
-                "새로 올라온 한패는 이 게임 버전용이지만 문장 자리가 원문과 맞지 않습니다 " +
+                "받아 둔 한패는 줄 수는 지금 게임과 같지만 문장 자리가 원문과 맞지 않습니다 " +
                     "(번역 안 된 줄 중 ${PatchViewModel.percent(ui.alignRatio.coerceAtLeast(0.0))} 일치). " +
-                    "한패 관리자가 고칠 때까지 넣지 않고 임시 복구를 씁니다."
+                    "게임이 줄 수를 그대로 둔 채 다시 업데이트됐거나 한패가 잘못 만들어진 경우입니다. " +
+                    "맞는 한패가 나올 때까지 넣지 않고 " + (if (ui.keepsTarget) "지금 파일을 그대로 둡니다." else "임시 복구를 씁니다.")
             )
             // 넣게 될 한패가 무엇인지 버튼에 적는다: 받은 시각, 원문과 자리 일치율
             val patchInfo = listOfNotNull(
@@ -396,9 +418,9 @@ private fun ActionButtons(ui: UiState, vm: PatchViewModel) {
                 onClick = { vm.forceApply() },
                 enabled = !ui.busy && ui.shizuku == ShizukuState.READY,
             ) { Text("그래도 이 한패 적용 ($patchInfo)") }
-        } else if (mismatch && !ui.canRepair && ui.status != PatchStatus.REPAIRED) {
+        } else if (mismatch && !ui.canRepair && ui.status != PatchStatus.REPAIRED && !ui.keepsTarget) {
             Notice(
-                "받아 둔 한패는 이전 게임 버전용이라 넣지 않습니다. " +
+                "받아 둔 한패는 지금 게임 버전용이 아니라 넣지 않습니다. " +
                     if (ui.canBootstrap) "아래 '번역 메모리 준비'를 하면 임시 복구할 수 있습니다." else "새 한패가 나오면 알려드립니다."
             )
         }
@@ -635,9 +657,12 @@ private fun PatchFileCard(ui: UiState, vm: PatchViewModel) {
             InfoRow(
                 "게임 버전",
                 when {
-                    ui.patchMisaligned -> "받은 한패는 이 버전용이지만 문장 자리가 원문과 맞지 않습니다"
+                    ui.patchMisaligned -> "받은 한패는 지금 게임과 줄 수는 같지만 문장 자리가 맞지 않습니다"
                     ui.patchMatchesGame == true -> "받은 한패가 지금 게임 버전용입니다"
-                    ui.patchMatchesGame == false -> "받은 한패는 이전 게임 버전용입니다"
+                    ui.keepsTarget && ui.status == PatchStatus.PATCHED_OLD -> "새로 받은 한패는 아직 이 게임 버전용이 아닙니다"
+                    ui.patchMatchesGame == false && (ui.status == PatchStatus.OFFICIAL || ui.status == PatchStatus.REPAIRED) ->
+                        "받은 한패는 이전 게임 버전용입니다"
+                    ui.patchMatchesGame == false -> "받은 한패는 지금 게임 버전용이 아닙니다"
                     ui.gameVersionUnknown && ui.cacheSha.isNotEmpty() -> "게임 버전을 확인할 수 없습니다 (게임이 업데이트되면 다시 확인합니다)"
                     else -> "확인 전"
                 }
@@ -795,7 +820,7 @@ private fun MaintenanceCard(ui: UiState, vm: PatchViewModel) {
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 OutlinedButton(
                     onClick = { vm.restoreBackup() },
-                    enabled = !ui.busy && ui.hasBackup,
+                    enabled = !ui.busy && ui.hasOriginal && ui.status != PatchStatus.OFFICIAL,
                     modifier = Modifier.weight(1f),
                 ) {
                     Icon(Icons.Rounded.RestartAlt, contentDescription = null, modifier = Modifier.size(18.dp))
@@ -810,8 +835,9 @@ private fun MaintenanceCard(ui: UiState, vm: PatchViewModel) {
                 ) { Text("패치 제거") }
             }
             Text(
-                if (ui.hasBackup) "최초 적용 시 원본 파일을 백업해 두었습니다."
-                else "게임 폴더에 파일이 있던 경우, 최초 적용 시 자동 백업됩니다.",
+                "원본 복원은 지금 게임 버전의 공식 원본 보관본을 먼저 쓰고, 없으면 최초 적용 때 백업한 원본을 씁니다. " +
+                    if (ui.hasBackup) "최초 적용 시 원본 파일을 백업해 두었습니다."
+                    else "게임 폴더에 원본이 있던 경우, 최초 적용 시 자동 백업됩니다.",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
@@ -828,12 +854,12 @@ private enum class StorageItem(val title: String, val warning: String) {
     ),
     OFFICIAL(
         "공식 원본 보관본을 지울까요?",
-        "지금 게임 버전으로 임시 복구하거나 번역 메모리를 새 번역으로 갱신할 때 씁니다. " +
+        "지금 게임 버전으로 임시 복구하거나 번역 메모리를 새 번역으로 갱신하거나 원본으로 되돌릴 때 씁니다. " +
             "게임 파일이 원본(중국어)으로 돌아오면 다시 보관합니다.",
     ),
     BACKUP(
         "원본 백업을 지울까요?",
-        "'원본 복원'을 못 하게 되고, 번역 메모리를 준비하는 데도 못 씁니다.",
+        "지금 게임 버전의 공식 원본 보관본이 없으면 '원본 복원'을 못 하게 되고, 번역 메모리를 준비하는 데도 못 씁니다.",
     ),
 }
 
